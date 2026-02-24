@@ -7,6 +7,7 @@ import {
     CHUNK_INDEX_RANGE,
     CHUNK_SIZE,
     MAX_LIGHT_LEVEL,
+    USE_CHUNK_MESH_WORKER,
 } from "./ChunkConstants";
 
 class ChunkManager {
@@ -17,7 +18,7 @@ class ChunkManager {
         this._chunkRemeshOptions = new Map();
         this._scene = scene;
         this._chunkMeshManager = new ChunkMeshManager();
-        this._viewDistance = 256;
+        this._viewDistance = 50;
         this._viewDistanceEnabled = true;
         this._blockTypeCache = new Map();
         this._isBulkLoading = false; // Flag to indicate if we're in a bulk loading operation
@@ -28,6 +29,7 @@ class ChunkManager {
         this._meshBuildStartTime = null;
         this._chunkLastMeshedTime = null;
         this._chunkLastQueuedTime = null;
+        this._frustum = null;
 
         this._setupBlockTypeChangeListener();
     }
@@ -186,7 +188,7 @@ class ChunkManager {
         return !!this.getGlobalBlockType(globalCoordinate);
     }
 
-    processRenderQueue(prioritizeCloseChunks = false) {
+    async processRenderQueue(prioritizeCloseChunks = false) {
         if (this._renderChunkQueue.length === 0) {
             return;
         }
@@ -258,14 +260,36 @@ class ChunkManager {
             this._pendingRenderChunks.delete(chunkId);
 
             if (chunk) {
-                this._renderChunk(chunk);
+                await this._renderChunk(chunk);
             }
         }
 
         if (this._renderChunkQueue.length > 0) {
-            window.requestAnimationFrame(() =>
-                this.processRenderQueue(prioritizeCloseChunks)
-            );
+            const scheduleNext = () => {
+                this.processRenderQueue(prioritizeCloseChunks);
+            };
+            if (prioritizeCloseChunks && this._scene.camera) {
+                const nextId = this._renderChunkQueue[0];
+                const nextChunk = this._chunks.get(nextId);
+                const priorityDistance = (this._viewDistance || 50) * 0.6;
+                const isNextClose =
+                    nextChunk &&
+                    new THREE.Vector3(
+                        nextChunk.originCoordinate.x + CHUNK_SIZE / 2,
+                        nextChunk.originCoordinate.y + CHUNK_SIZE / 2,
+                        nextChunk.originCoordinate.z + CHUNK_SIZE / 2
+                    ).distanceTo(this._scene.camera.position) <= priorityDistance;
+                if (isNextClose) {
+                    window.requestAnimationFrame(scheduleNext);
+                    return;
+                }
+            }
+            const scheduleIdle =
+                typeof window.requestIdleCallback === "function"
+                    ? (fn) =>
+                          window.requestIdleCallback(fn, { timeout: 50 })
+                    : (fn) => setTimeout(fn, 1);
+            scheduleIdle(scheduleNext);
         }
     }
 
@@ -378,7 +402,7 @@ class ChunkManager {
         processBatch();
     }
 
-    _renderChunk(chunk) {
+    async _renderChunk(chunk) {
         if (!this._lastMeshBuildTime) {
             this._lastMeshBuildTime = performance.now();
             this._meshBuildCount = 0;
@@ -387,9 +411,9 @@ class ChunkManager {
             const now = performance.now();
             const elapsed = now - this._lastMeshBuildTime;
 
-            // Lower per-chunk delay so chunks appear faster; keep adaptive based on queue length
+            // Space out mesh builds to keep main thread responsive (roadmap: more spacing)
             const timeBetweenBuilds =
-                this._renderChunkQueue.length > 10 ? 2 : 10;
+                this._renderChunkQueue.length > 10 ? 6 : 20;
             if (elapsed < timeBetweenBuilds) {
                 window.requestAnimationFrame(() => this._renderChunk(chunk));
                 return;
@@ -431,16 +455,46 @@ class ChunkManager {
             }
         }
 
-        try {
+        const applyWorkerResult = (result) => {
+            const { solid, liquid } = result;
+            if (chunk._solidMesh) this._chunkMeshManager.removeSolidMesh(chunk);
+            if (chunk._liquidMesh) this._chunkMeshManager.removeLiquidMesh(chunk);
+            if (solid.positions.length > 0) {
+                chunk._solidMesh = this._chunkMeshManager.getSolidMesh(chunk, solid);
+                if (this._scene) this._scene.add(chunk._solidMesh);
+            }
+            if (liquid.positions.length > 0) {
+                chunk._liquidMesh = this._chunkMeshManager.getLiquidMesh(chunk, liquid);
+                if (this._scene) this._scene.add(chunk._liquidMesh);
+            }
+        };
+
+        const doBuild = async () => {
             if (
                 forceCompleteRebuild ||
                 isFirstBlockInChunk ||
                 !hasExistingMeshes ||
                 !hasBlockCoords
             ) {
-                // Ensure a flush of buffers by nudging and reverting
                 chunk._nudgeBlockForRemesh?.();
-                chunk.buildMeshes(this, options);
+                if (USE_CHUNK_MESH_WORKER) {
+                    const {
+                        canUseWorker,
+                        buildMeshesInWorker,
+                    } = await import("./ChunkMeshWorkerBridge");
+                    if (canUseWorker(chunk, this)) {
+                        const wr = await buildMeshesInWorker(chunk, this);
+                        if (wr?.ok && wr.result) {
+                            applyWorkerResult(wr.result);
+                        } else {
+                            chunk.buildMeshes(this, options);
+                        }
+                    } else {
+                        chunk.buildMeshes(this, options);
+                    }
+                } else {
+                    chunk.buildMeshes(this, options);
+                }
 
                 const shouldBeVisible = this._isChunkVisible(chunk.chunkId);
                 chunk.visible = shouldBeVisible;
@@ -459,6 +513,10 @@ class ChunkManager {
                     this._chunkRemeshOptions.delete(chunk.chunkId);
                 }
             }
+        };
+
+        try {
+            await doBuild();
 
             if (!this._chunkLastMeshedTime) {
                 this._chunkLastMeshedTime = new Map();
@@ -776,6 +834,10 @@ class ChunkManager {
         this._viewDistance = distance;
     }
 
+    setFrustum(frustum) {
+        this._frustum = frustum;
+    }
+
     setViewDistanceEnabled(enabled) {
         this._viewDistanceEnabled = enabled;
         if (!enabled) {
@@ -818,13 +880,26 @@ class ChunkManager {
         const effectiveViewDistance = isBulkLoading
             ? Math.min(32, this._viewDistance / 2)
             : this._viewDistance;
+        const _box = new THREE.Box3();
+        const _vMin = new THREE.Vector3();
+        const _vMax = new THREE.Vector3();
         this._chunks.forEach((chunk) => {
             const coord = chunk.originCoordinate;
-            const chunkPos = new THREE.Vector3(coord.x, coord.y, coord.z);
-            const distance = chunkPos.distanceTo(cameraPos);
+            const chunkCenter = new THREE.Vector3(
+                coord.x + CHUNK_SIZE / 2,
+                coord.y + CHUNK_SIZE / 2,
+                coord.z + CHUNK_SIZE / 2
+            );
+            const distance = chunkCenter.distanceTo(cameraPos);
             const wasVisible = chunk.visible;
 
-            const shouldBeVisible = distance <= effectiveViewDistance;
+            let shouldBeVisible = distance <= effectiveViewDistance;
+            if (shouldBeVisible && this._frustum) {
+                _vMin.set(coord.x, coord.y, coord.z);
+                _vMax.set(coord.x + CHUNK_SIZE, coord.y + CHUNK_SIZE, coord.z + CHUNK_SIZE);
+                _box.set(_vMin, _vMax);
+                shouldBeVisible = this._frustum.intersectsBox(_box);
+            }
 
             if (isBulkLoading && distance > effectiveViewDistance * 1.5) {
                 chunk.visible = false;
@@ -862,6 +937,11 @@ class ChunkManager {
             }
         });
 
+        // Evict distant chunks to reduce memory (max 8 per frame to avoid hitches)
+        if (!isBulkLoading && this._viewDistanceEnabled) {
+            this._evictDistantChunks(cameraPos, effectiveViewDistance, 8);
+        }
+
         return {
             total: this._chunks.size,
             visible: visibleCount,
@@ -869,6 +949,65 @@ class ChunkManager {
             changed: visibilityChangedCount,
             toggled: forcedToggleCount,
         };
+    }
+
+    /**
+     * Evict chunks beyond eviction distance to free memory.
+     * Chunks can be re-loaded from VirtualTerrainStore when camera returns.
+     * @param {THREE.Vector3} cameraPos - Camera position
+     * @param {number} viewDistance - Current view distance
+     * @param {number} maxPerFrame - Max chunks to evict per call (avoids hitches)
+     */
+    _evictDistantChunks(cameraPos, viewDistance, maxPerFrame = 8) {
+        const evictionDistance = viewDistance * 2;
+        const _chunkCenter = new THREE.Vector3();
+        const toEvict = [];
+        this._chunks.forEach((chunk) => {
+            const coord = chunk.originCoordinate;
+            _chunkCenter.set(
+                coord.x + CHUNK_SIZE / 2,
+                coord.y + CHUNK_SIZE / 2,
+                coord.z + CHUNK_SIZE / 2
+            );
+            if (_chunkCenter.distanceTo(cameraPos) > evictionDistance) {
+                toEvict.push(chunk);
+            }
+        });
+        // Evict furthest first, up to maxPerFrame
+        toEvict.sort((a, b) => {
+            const da = _chunkCenter
+                .set(
+                    a.originCoordinate.x + CHUNK_SIZE / 2,
+                    a.originCoordinate.y + CHUNK_SIZE / 2,
+                    a.originCoordinate.z + CHUNK_SIZE / 2
+                )
+                .distanceToSquared(cameraPos);
+            const db = _chunkCenter
+                .set(
+                    b.originCoordinate.x + CHUNK_SIZE / 2,
+                    b.originCoordinate.y + CHUNK_SIZE / 2,
+                    b.originCoordinate.z + CHUNK_SIZE / 2
+                )
+                .distanceToSquared(cameraPos);
+            return db - da;
+        });
+        const evictNow = toEvict.slice(0, maxPerFrame);
+        for (const chunk of evictNow) {
+            this._chunkMeshManager.removeLiquidMesh(chunk);
+            this._chunkMeshManager.removeSolidMesh(chunk);
+            this._chunks.delete(chunk.chunkId);
+            this._renderChunkQueue = this._renderChunkQueue.filter(
+                (id) => id !== chunk.chunkId
+            );
+            this._pendingRenderChunks.delete(chunk.chunkId);
+            this._chunkRemeshOptions.delete(chunk.chunkId);
+            this._deferredMeshChunks.delete(chunk.chunkId);
+            if (this._chunkLastMeshedTime) this._chunkLastMeshedTime.delete(chunk.chunkId);
+            if (this._chunkLastQueuedTime) this._chunkLastQueuedTime.delete(chunk.chunkId);
+        }
+        if (evictNow.length > 0) {
+            this._blockTypeCache.clear();
+        }
     }
 
     getChunkByKey(chunkKey) {
@@ -978,22 +1117,29 @@ class ChunkManager {
         if (!chunk) return false;
 
         if (!this._scene || !this._scene.camera) return true;
+        if (!this._viewDistanceEnabled) return true;
 
         const cameraPos = this._scene.camera.position;
-
+        const coord = chunk.originCoordinate;
         const chunkCenter = new THREE.Vector3(
-            chunk.originCoordinate.x + CHUNK_SIZE / 2,
-            chunk.originCoordinate.y + CHUNK_SIZE / 2,
-            chunk.originCoordinate.z + CHUNK_SIZE / 2
+            coord.x + CHUNK_SIZE / 2,
+            coord.y + CHUNK_SIZE / 2,
+            coord.z + CHUNK_SIZE / 2
         );
 
         const distance = chunkCenter.distanceTo(cameraPos);
+        if (distance > this._viewDistance) return false;
 
-        const viewDistance = this._viewDistance;
+        // Cone-of-vision: chunk must intersect camera frustum
+        if (this._frustum) {
+            const box = new THREE.Box3(
+                new THREE.Vector3(coord.x, coord.y, coord.z),
+                new THREE.Vector3(coord.x + CHUNK_SIZE, coord.y + CHUNK_SIZE, coord.z + CHUNK_SIZE)
+            );
+            if (!this._frustum.intersectsBox(box)) return false;
+        }
 
-        if (!this._viewDistanceEnabled) return true;
-
-        return distance <= viewDistance;
+        return true;
     }
 
     _setupBlockTypeChangeListener() {

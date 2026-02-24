@@ -232,17 +232,41 @@ class SpatialGridManager {
             this.loadingManager.showLoadingScreen(message);
         }
 
+        // For virtual terrain (large worlds), use batched iteration to avoid OOM
+        // and postMessage size limits when passing millions of blocks to the worker
+        if (typeof terrainBlocks?.getBlocksInBatches === "function") {
+            if (force) this.spatialHashGrid.clear();
+            const BATCH = 50000;
+            await terrainBlocks.getBlocksInBatches(BATCH, (batch) => {
+                this.processBatch(batch);
+                return new Promise((r) => setTimeout(r, 0));
+            });
+            this.isProcessing = false;
+            if (
+                showLoadingScreen &&
+                this.loadingManager &&
+                typeof this.loadingManager.hideLoadingScreen === "function"
+            ) {
+                this.loadingManager.hideLoadingScreen();
+            }
+            return;
+        }
+
         const blocks = Object.entries(terrainBlocks);
 
         if (force) {
             this.spatialHashGrid.clear();
         }
 
+        // Avoid worker for very large payloads (postMessage can fail or OOM)
+        const LARGE_BLOCK_THRESHOLD = 500000;
         let workerSuccess = false;
-        try {
-            workerSuccess = await this.processWithWorker(blocks);
-        } catch (error) {
-            // Worker error, falling back to direct processing
+        if (blocks.length < LARGE_BLOCK_THRESHOLD) {
+            try {
+                workerSuccess = await this.processWithWorker(blocks);
+            } catch (error) {
+                // Worker error, falling back to direct processing
+            }
         }
 
         if (!workerSuccess) {

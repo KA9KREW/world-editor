@@ -496,7 +496,8 @@ class WallTool extends BaseTool {
 
                 if (!this.terrainRef.current[posKey]) continue;
 
-                removedBlocks[posKey] = this.terrainRef.current[posKey];
+                const blockId = this.terrainRef.current[posKey];
+                removedBlocks[posKey] = blockId;
 
                 // Track rotation and shape being removed for undo
                 if (rotationsRef[posKey]) {

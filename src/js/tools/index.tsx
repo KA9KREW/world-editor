@@ -11,6 +11,7 @@ import SelectionTool from "./SelectionTool";
 import { TerrainTool } from "./TerrainTool";
 import ReplaceTool from "./ReplaceTool";
 import FindReplaceTool from "./FindReplaceTool";
+import SeedGeneratorTool from "./SeedGeneratorTool";
 
 export {
     BaseTool,
@@ -23,4 +24,5 @@ export {
     TerrainTool,
     ReplaceTool,
     FindReplaceTool,
+    SeedGeneratorTool,
 };

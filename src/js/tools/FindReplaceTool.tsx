@@ -836,8 +836,8 @@ export default class FindReplaceTool extends BaseTool {
                 const worldKey = `${match.position.x + px},${match.position.y + py},${match.position.z + pz}`;
 
                 if (terrainData[worldKey] !== undefined) {
-                    removedBlocks[worldKey] = terrainData[worldKey];
-                    // Track rotation and shape being removed
+                    const blockId = terrainData[worldKey];
+                    removedBlocks[worldKey] = blockId;
                     if (rotationsRef[worldKey]) {
                         removedRotations[worldKey] = rotationsRef[worldKey];
                     }

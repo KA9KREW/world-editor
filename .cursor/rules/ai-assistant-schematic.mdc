@@ -1,0 +1,40 @@
+---
+description: Generate schematics for the world editor AI Assistant (Paste from Cursor)
+alwaysApply: true
+---
+
+# AI Assistant Schematic Format
+
+When the user asks to generate a building, structure, or schematic for the world editor, output valid JSON in this format:
+
+```json
+{
+  "blocks": {
+    "x,y,z": blockId,
+    "0,0,0": 17,
+    "1,0,0": 10,
+    "0,1,0": 56
+  },
+  "entities": [
+    {
+      "position": [x, y, z],
+      "entityName": "oak-tree",
+      "rotation": [0, 0, 0]
+    }
+  ]
+}
+```
+
+## Rules
+- **blocks**: Object mapping position keys `"x,y,z"` (integers) to block IDs (numbers)
+- **entities** (optional): Array of `{ position: [x,y,z], entityName: string, rotation?: [x,y,z] }`
+- Block IDs come from `src/js/blocks/block-manifest.json` (e.g. 17=cobblestone, 10=bricks, 56=grass, 31=dirt, 5=birch-log)
+- Origin (0,0,0) is typically ground level; Y increases upward
+- Keep structures small (5–20 blocks) unless asked otherwise
+
+## Example prompts that trigger this
+- "Generate a schematic for a small stone hut"
+- "Create a 3x3 brick tower for the world editor"
+- "Make a schematic for a wooden cabin"
+
+Respond with **only the JSON** so the user can paste it into the AI Assistant's "Paste from Cursor" field.

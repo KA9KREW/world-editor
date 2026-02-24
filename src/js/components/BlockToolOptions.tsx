@@ -19,6 +19,7 @@ import SkyboxOptionsSection from "./SkyboxOptionsSection";
 import LightingOptionsSection from "./LightingOptionsSection";
 import EntityOptionsSection from "./EntityOptionsSection";
 import ZoneToolOptionsSection from "./ZoneToolOptionsSection";
+import SeedGeneratorToolOptionsSection from "./SeedGeneratorToolOptionsSection";
 import ScreenshotGallerySection from "./ScreenshotGallerySection";
 
 interface BlockToolOptionsProps {
@@ -157,6 +158,7 @@ export function BlockToolOptions({
             replace: "Replace Tool",
             findreplace: "Find & Replace",
             zone: "Zone Tool",
+            seed: "Seed Generator",
         };
         if (activeTool && toolToSection[activeTool]) {
             setOpenSection(toolToSection[activeTool]);
@@ -262,8 +264,6 @@ export function BlockToolOptions({
                         <AIAssistantPanel
                             isVisible={true}
                             isEmbedded={true}
-                            getAvailableBlocks={getAvailableBlocks}
-                            getAvailableEntities={getAvailableEntities}
                             loadAISchematic={loadAISchematic}
                         />
                     </CollapsibleSection>
@@ -346,6 +346,14 @@ export function BlockToolOptions({
                     <CollapsibleSection title="Zone Tool" animationDelay="0.09s" isOpen={openSection === "Zone Tool"} onToggle={() => handleSectionToggle("Zone Tool")}>
                         <ZoneToolOptionsSection
                             zoneTool={terrainBuilderRef?.current?.toolManagerRef?.current?.tools?.["zone"]}
+                            isCompactMode={isCompactMode}
+                        />
+                    </CollapsibleSection>
+                )}
+                {activeTool === "seed" && (
+                    <CollapsibleSection title="Seed Generator" animationDelay="0.09s" isOpen={openSection === "Seed Generator"} onToggle={() => handleSectionToggle("Seed Generator")}>
+                        <SeedGeneratorToolOptionsSection
+                            seedGeneratorTool={terrainBuilderRef?.current?.toolManagerRef?.current?.tools?.["seed"]}
                             isCompactMode={isCompactMode}
                         />
                     </CollapsibleSection>

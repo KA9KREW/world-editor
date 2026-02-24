@@ -4,6 +4,7 @@ import BlockMaterial from "../blocks/BlockMaterial";
 import BlockTypeRegistry from "../blocks/BlockTypeRegistry";
 import ChunkSystem from "./ChunkSystem";
 import { CHUNK_SIZE } from "./ChunkConstants";
+import { invalidateWorkerCache } from "./ChunkMeshWorkerBridge";
 
 let chunkSystem = null;
 /**
@@ -93,6 +94,40 @@ export const processChunkRenderQueue = () => {
     chunkSystem.processRenderQueue(true);
 };
 /**
+ * Update the chunk system from VirtualTerrainStore without building full snapshot (streamed).
+ * Use for large worlds to avoid OOM and reduce main-thread blocking.
+ */
+export const updateTerrainChunksFromStore = async (
+    store,
+    onlyVisibleChunks = false,
+    environmentBuilderRef = null,
+    rotationData = null,
+    shapeData = null
+) => {
+    if (!chunkSystem || !store?.getBlocksInBatches) {
+        return { totalBlocks: 0, visibleBlocks: 0 };
+    }
+    if (onlyVisibleChunks && chunkSystem._scene?.camera) {
+        const viewDistance = chunkSystem._viewDistance || 50;
+        chunkSystem.setBulkLoadingMode(true, viewDistance * 0.5);
+    } else {
+        chunkSystem.setBulkLoadingMode(false);
+    }
+    await chunkSystem.updateFromTerrainDataFromStore(store, rotationData || undefined, shapeData || undefined);
+    setTimeout(() => {
+        if (chunkSystem) {
+            chunkSystem._chunkManager.processRenderQueue(true);
+            setTimeout(() => {
+                chunkSystem.setBulkLoadingMode(false);
+                chunkSystem._chunkManager.processRenderQueue(true);
+            }, 2000);
+        }
+    }, 100);
+    const count = store.getBlockCountApprox?.() ?? 0;
+    return { totalBlocks: count, visibleBlocks: count };
+};
+
+/**
  * Update the chunk system from terrain data
  * @param {Object} terrainData - The terrain data in format { "x,y,z": blockId }
  * @param {boolean} onlyVisibleChunks - If true, only create meshes for chunks within view distance
@@ -119,7 +154,7 @@ export const updateTerrainChunks = (
     }
 
     if (onlyVisibleChunks && chunkSystem._scene.camera) {
-        const viewDistance = chunkSystem._viewDistance || 256; // Default view distance
+        const viewDistance = chunkSystem._viewDistance || 50;
         const priorityDistance = viewDistance * 0.5;
         chunkSystem.setBulkLoadingMode(true, priorityDistance);
     } else {
@@ -419,6 +454,7 @@ export const refreshChunkMaterials = () => {
 export const rebuildTextureAtlas = async () => {
     THREE.Texture.DEFAULT_FILTER = THREE.NearestFilter;
     try {
+        invalidateWorkerCache();
         await BlockTextureAtlas.instance.rebuildTextureAtlas();
 
         // Only preload essential block types (those actually used in terrain)

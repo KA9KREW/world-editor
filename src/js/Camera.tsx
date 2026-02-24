@@ -253,7 +253,6 @@ class CameraManager {
 
         // Apply deltaTime to make movement frame-rate independent
         const frameAdjustedMoveSpeed = this.moveSpeed * deltaTime;
-        const frameAdjustedRotateSpeed = this.rotateSpeed * deltaTime;
 
         if (
             this.keys.has("w") ||
@@ -280,42 +279,33 @@ class CameraManager {
         }
 
         if (this.keys.has("a") || this.keys.has("arrowleft")) {
-            if (this.isPointerUnlockedMode) {
-                this.camera.rotateY(frameAdjustedRotateSpeed);
-            } else {
-                const direction = new THREE.Vector3();
-                this.camera.getWorldDirection(direction);
-                direction.y = 0;
-                direction.normalize();
-                const leftVector = new THREE.Vector3(
-                    direction.z,
-                    0,
-                    -direction.x
-                );
-                this.camera.position.add(
-                    leftVector.multiplyScalar(frameAdjustedMoveSpeed)
-                );
-            }
-
+            const direction = new THREE.Vector3();
+            this.camera.getWorldDirection(direction);
+            direction.y = 0;
+            direction.normalize();
+            const leftVector = new THREE.Vector3(
+                direction.z,
+                0,
+                -direction.x
+            );
+            this.camera.position.add(
+                leftVector.multiplyScalar(frameAdjustedMoveSpeed)
+            );
             moved = true;
         }
         if (this.keys.has("d") || this.keys.has("arrowright")) {
-            if (this.isPointerUnlockedMode) {
-                this.camera.rotateY(-frameAdjustedRotateSpeed);
-            } else {
-                const direction = new THREE.Vector3();
-                this.camera.getWorldDirection(direction);
-                direction.y = 0;
-                direction.normalize();
-                const rightVector = new THREE.Vector3(
-                    -direction.z,
-                    0,
-                    direction.x
-                );
-                this.camera.position.add(
-                    rightVector.multiplyScalar(frameAdjustedMoveSpeed)
-                );
-            }
+            const direction = new THREE.Vector3();
+            this.camera.getWorldDirection(direction);
+            direction.y = 0;
+            direction.normalize();
+            const rightVector = new THREE.Vector3(
+                -direction.z,
+                0,
+                direction.x
+            );
+            this.camera.position.add(
+                rightVector.multiplyScalar(frameAdjustedMoveSpeed)
+            );
             moved = true;
         }
 
@@ -390,10 +380,10 @@ class CameraManager {
         if (this._isInputDisabled) return;
 
         const target = event.target;
+        const active = document.activeElement;
         const isInput =
-            target.tagName === "INPUT" ||
-            target.tagName === "TEXTAREA" ||
-            target.isContentEditable;
+            (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || (target as HTMLElement).isContentEditable)) ||
+            (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA" || active.tagName === "SELECT" || (active as HTMLElement).isContentEditable));
 
         const movementKeys = [
             "w",
@@ -422,7 +412,7 @@ class CameraManager {
         if (
             isInput &&
             event.key &&
-            movementKeys.includes(event.key.toLowerCase())
+            (movementKeys.includes(event.key.toLowerCase()) || event.key === "0")
         ) {
             return;
         }
@@ -436,6 +426,11 @@ class CameraManager {
         }
 
         if (event.key === "0") {
+            let el: Node | null = target;
+            while (el) {
+                if (el instanceof HTMLElement && el.hasAttribute?.("data-ignore-camera-hotkey")) return;
+                el = el.parentNode;
+            }
             this.isPointerUnlockedMode = !this.isPointerUnlockedMode;
             const enteringRotate = this.isPointerUnlockedMode;
             if (enteringRotate && this.isPointerLocked && document.exitPointerLock) {

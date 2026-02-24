@@ -19,7 +19,8 @@ import {
     FaWrench,
     FaHome,
     FaArrowUp,
-    FaBorderAll
+    FaBorderAll,
+    FaSeedling,
 } from "react-icons/fa";
 import pako from "pako";
 import "../../css/ToolBar.css";
@@ -1377,6 +1378,17 @@ const ToolBar = ({
                                 className="control-button"
                             >
                                 <FaMountain className="text-[#F1F1F1] group-hover:scale-[1.02] transition-all" />
+                            </button>
+                        </Tooltip>
+                        <Tooltip text="Seed Generator - Generate worlds from a seed value">
+                            <button
+                                onClick={() => {
+                                    handleToolToggle("seed");
+                                    setPlacementSize("single");
+                                }}
+                                className={`control-button ${activeTool === "seed" ? "selected" : ""}`}
+                            >
+                                <FaSeedling className="text-[#F1F1F1] group-hover:scale-[1.02] transition-all" />
                             </button>
                         </Tooltip>
                         <Tooltip text="Import Axiom Blueprint (.bp)">

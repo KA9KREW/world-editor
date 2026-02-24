@@ -8,6 +8,7 @@ import {
     CHUNK_BUFFER_GEOMETRY_NUM_UV_COMPONENTS,
     CHUNK_BUFFER_GEOMETRY_NUM_COLOR_COMPONENTS,
     MAX_SOLID_MESH_POOL_SIZE,
+    MAX_LIQUID_MESH_POOL_SIZE,
 } from "./ChunkConstants";
 import BlockTextureAtlas from "../blocks/BlockTextureAtlas";
 /**
@@ -155,7 +156,7 @@ class ChunkMeshManager {
             mesh.userData = {};
 
             this._liquidMeshes.delete(chunk.chunkId);
-            if (this._liquidMeshPool.length < MAX_SOLID_MESH_POOL_SIZE) {
+            if (this._liquidMeshPool.length < MAX_LIQUID_MESH_POOL_SIZE) {
 
                 this._cleanMeshForReuse(mesh);
                 this._liquidMeshPool.push(mesh);

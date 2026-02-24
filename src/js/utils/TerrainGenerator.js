@@ -1,1330 +1,1010 @@
 /**
  * TerrainGenerator.js - Hytopia terrain generation utility
  *
- * This utility handles the generation of Hytopia terrain with biomes,
- * caves, rivers, lakes, and ore distribution based on a seed value.
+ * Generates Minecraft-style terrain with biomes, caves, rivers, lakes,
+ * ore distribution, and biome-specific vegetation based on a seed value.
+ * Hollow worlds: only topsoil layer (surface + subsurface), no rock or bedrock.
  */
 import {
     generatePerlinNoise,
     generatePerlinNoise3D,
 } from "./PerlinNoiseGenerator";
-/**
- * Generates a Hytopia world from a seed
- * @param {Object} settings - Generation settings
- * @param {number} seedNum - The numeric seed value
- * @param {Object} blockTypes - Map of block types to IDs
- * @param {Function} progressCallback - Optional callback for progress updates
- * @returns {Object} The generated terrain data
- */
+import { RegionBlockStore, asTerrainDataProxy, iteratePackedRegion } from "./BlockRegionPacker";
+import {
+    SURFACE_BY_BIOME,
+    SUBSURFACE_BY_BIOME,
+    ROCKY_SURFACE,
+    MOUNTAIN_STONE,
+    STONE_VARIANTS,
+    DEEPSLATE_VARIANTS,
+    TREE_BY_BIOME,
+    pickWeighted,
+    resolveBlock,
+} from "./TerrainBlockMap";
+
+// ---------------------------------------------------------------------------
+// Biome → Block helpers (uses full block map)
+// ---------------------------------------------------------------------------
+
+function getSurfaceBlock(biome, blockTypes, rockValue, cobblestoneFeatures) {
+    if (cobblestoneFeatures && rockValue > 0.85) {
+        const id = resolveBlock(blockTypes, ROCKY_SURFACE);
+        if (id) return id;
+    }
+    const list = SURFACE_BY_BIOME[biome] ?? SURFACE_BY_BIOME.plains;
+    const id = resolveBlock(blockTypes, list);
+    return id || blockTypes.stone;
+}
+
+function getSubSurfaceBlock(biome, blockTypes, depth) {
+    const list = SUBSURFACE_BY_BIOME[biome] ?? ["dirt"];
+    if (biome?.startsWith("snowy") && depth <= 1) {
+        const id = resolveBlock(blockTypes, ["grass-snow-block", "snow", ...list]);
+        if (id) return id;
+    }
+    const id = resolveBlock(blockTypes, list);
+    return id || blockTypes.dirt;
+}
+
+function getStoneBlock(blockTypes, y, rng) {
+    const DEEPSLATE_TRANSITION = 16;
+    if (y <= DEEPSLATE_TRANSITION) {
+        const name = pickWeighted(DEEPSLATE_VARIANTS, rng);
+        return blockTypes[name] || blockTypes.deepslate || blockTypes.stone;
+    }
+    const name = pickWeighted(STONE_VARIANTS, rng);
+    return blockTypes[name] || blockTypes.stone;
+}
+
+function getTreeConfig(biome, blockTypes, rng) {
+    const t = TREE_BY_BIOME[biome] || { log: "oak-log", leaf: "oak-leaves" };
+    const logId = blockTypes[t.log] || blockTypes["oak-log"] || blockTypes.stone;
+    const leafId = blockTypes[t.leaf] || blockTypes["oak-leaves"] || blockTypes.stone;
+    const probMap = { forest: 0.30, taiga: 0.28, plains: 0.08, savanna: 0.06, jungle: 0.35, swamp: 0.20, snowy_forest: 0.25, snowy_taiga: 0.28, snowy_plains: 0.05, poplar_forest: 0.25, cherry_grove: 0.22 };
+    const prob = probMap[biome] ?? 0.20;
+    const heightMap = { taiga: [6, 2], jungle: [7, 3], savanna: [5, 3], swamp: [4, 2], snowy_taiga: [6, 2], poplar_forest: [6, 3] };
+    const [hBase, hRand] = heightMap[biome] ?? [5, 2];
+    const radiusMap = { jungle: 3, savanna: 3, cherry_grove: 3 };
+    const radius = radiusMap[biome] ?? 2;
+    return { log: logId, leaf: leafId, height: hBase + Math.floor(rng() * hRand), radius, prob };
+}
+
+// ---------------------------------------------------------------------------
+// Main generation
+// ---------------------------------------------------------------------------
+
 export function generateHytopiaWorld(
     settings,
     seedNum,
     blockTypes,
     progressCallback = null
 ) {
-    console.log("Starting world generation with block types:", blockTypes);
     const updateProgress = (message, progress) => {
-        console.log(message);
-        if (progressCallback) {
-            progressCallback(message, progress);
-        }
+        if (progressCallback) progressCallback(message, progress);
     };
     updateProgress("Starting seed-based world generation...", 0);
 
-    const worldSettings = {
-        ...settings,
-        maxHeight: 64,
+    // Seeded PRNG
+    function mulberry32(a) {
+        return function () {
+            a |= 0;
+            a = (a + 0x6d2b79f5) | 0;
+            let t = Math.imul(a ^ (a >>> 15), 1 | a);
+            t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+    }
+    const rng = mulberry32(seedNum);
 
-    };
-    console.log(`Using sea level: ${worldSettings.seaLevel}`);
+    const maxHeight = settings.maxHeight ?? 64;
+    const seaLevel = settings.seaLevel ?? Math.floor(maxHeight * 0.55);
+    const width = settings.width;
+    const length = settings.length;
+    const startX = -Math.floor(width / 2);
+    const startZ = -Math.floor(length / 2);
 
+    const worldSettings = { ...settings, maxHeight };
+
+    // -----------------------------------------------------------------------
+    // 1. Heightmap (Minecraft/Hytale-style: multi-octave, elevation redistribution)
+    // -----------------------------------------------------------------------
     updateProgress("Generating heightmap...", 5);
 
-    const continentalNoise = generatePerlinNoise(
-        settings.width,
-        settings.length,
-        {
-            octaveCount: 1,
-            scale: settings.scale * 0.5,
-            persistence: 0.5,
-            amplitude: 1.0,
-            seed: seedNum,
-        }
-    );
-    const hillNoise = generatePerlinNoise(settings.width, settings.length, {
-        octaveCount: 3,
-        scale: settings.scale * 2,
-        persistence: 0.5,
-        amplitude: 0.5,
-        seed: seedNum + 1,
+    const scale = settings.scale || 0.04;
+    const continentalNoise = generatePerlinNoise(width, length, {
+        octaveCount: 2, scale: scale * 0.4, persistence: 0.6, amplitude: 1.0, seed: seedNum,
     });
-    const detailNoise = generatePerlinNoise(settings.width, settings.length, {
-        octaveCount: 5,
-        scale: settings.scale * 4,
-        persistence: 0.5,
-        amplitude: 0.2,
-        seed: seedNum + 2,
+    const hillNoise = generatePerlinNoise(width, length, {
+        octaveCount: 4, scale: scale * 1.5, persistence: 0.5, amplitude: 0.6, seed: seedNum + 1,
+    });
+    const detailNoise = generatePerlinNoise(width, length, {
+        octaveCount: 6, scale: scale * 4, persistence: 0.45, amplitude: 0.25, seed: seedNum + 2,
+    });
+    const rockNoise = generatePerlinNoise(width, length, {
+        octaveCount: 4, scale: settings.scale * 3, persistence: 0.6, amplitude: 0.4, seed: seedNum + 10,
+    });
+    const depthMap = generatePerlinNoise(width, length, {
+        octaveCount: 2, scale: 0.018, persistence: 0.5, amplitude: 0.25, seed: seedNum + 6,
+    });
+    const riverValleyNoise = generatePerlinNoise(width, length, {
+        octaveCount: 2, scale: (settings.riverFreq || 0.05) * 0.8, persistence: 0.5, amplitude: 1.0, seed: seedNum + 5,
     });
 
-    const rockNoise = generatePerlinNoise(settings.width, settings.length, {
-        octaveCount: 4,
-        scale: settings.scale * 3,
-        persistence: 0.6,
-        amplitude: 0.4,
-        seed: seedNum + 10,
-    });
-    const depthMap = generatePerlinNoise(settings.width, settings.length, {
-        octaveCount: 2,
-        scale: 0.02,
-        persistence: 0.5,
-        amplitude: 1.0,
-        seed: seedNum + 6,
-    });
-
-    const heightMap = new Float32Array(settings.width * settings.length);
+    const heightMap = new Float32Array(width * length);
+    const flatFactor = settings.flatnessFactor || 0;
+    const elevExp = settings.elevationExponent ?? 1.5;
+    const amp = (settings.baseAmplitude ?? 1.0) * 0.5;
+    const landBias = settings.landBias ?? 0.15;  // lift heightmap to reduce water worlds
 
     if (settings.isCompletelyFlat) {
-        const flatHeight = 0.25; // 25% of max height
-        for (let i = 0; i < heightMap.length; i++) {
-            heightMap[i] = flatHeight;
-        }
-        console.log("Generating completely flat terrain");
+        for (let i = 0; i < heightMap.length; i++) heightMap[i] = 0.25;
     } else {
-
         for (let i = 0; i < heightMap.length; i++) {
-
-            let baseTerrain = continentalNoise[i];
-
-            const hillInfluence =
-                hillNoise[i] * (1.0 - settings.flatnessFactor);
-
-            const detailInfluence =
-                detailNoise[i] * (1.0 - settings.flatnessFactor) * 0.5;
-
-            const depthInfluence =
-                depthMap[i] * (1.0 - settings.flatnessFactor) * 0.3;
-
-            const noiseValue =
-                (baseTerrain + hillInfluence + detailInfluence) *
-                (1.0 + depthInfluence);
-
-            heightMap[i] =
-                noiseValue * (1.0 - settings.flatnessFactor) +
-                0.5 * settings.flatnessFactor;
+            const base = continentalNoise[i];
+            const hill = hillNoise[i] * (1.0 - flatFactor);
+            const detail = detailNoise[i] * (1.0 - flatFactor) * 0.5;
+            const depth = depthMap[i] * (1.0 - flatFactor) * 0.2;
+            const riverValley = Math.max(0, riverValleyNoise[i] - 0.45) * 2.5; // 0..1, low where rivers run
+            const raw = (base + hill + detail) * (1.0 + depth) * amp;
+            const carved = Math.max(0, raw - riverValley * 0.35); // carve river valleys
+            const normalized = Math.max(0, Math.min(1, carved));
+            const lifted = Math.min(1, normalized + landBias);  // bias toward land
+            heightMap[i] = Math.pow(lifted, elevExp) * (1.0 - flatFactor) + 0.4 * flatFactor;
         }
     }
 
+    // Smooth
     updateProgress("Smoothing heightmap...", 10);
-    const smoothedHeightMap = new Float32Array(
-        settings.width * settings.length
-    );
-    const radius = Math.floor(2 + settings.terrainBlend * 2);
-    for (let z = 0; z < settings.length; z++) {
-        for (let x = 0; x < settings.width; x++) {
-            let total = 0;
-            let count = 0;
-
-            for (let dz = -radius; dz <= radius; dz++) {
-                for (let dx = -radius; dx <= radius; dx++) {
-                    const nx = x + dx;
-                    const nz = z + dz;
-                    if (
-                        nx >= 0 &&
-                        nx < settings.width &&
-                        nz >= 0 &&
-                        nz < settings.length
-                    ) {
-
-                        const distance = Math.sqrt(dx * dx + dz * dz);
-                        const weight = 1 / (1 + distance);
-                        total += heightMap[nz * settings.width + nx] * weight;
-                        count += weight;
+    const smoothedHeightMap = new Float32Array(width * length);
+    const sRadius = Math.floor(2 + (settings.terrainBlend || 0.5) * 2);
+    const smoothing = settings.smoothing || 0.7;
+    for (let z = 0; z < length; z++) {
+        for (let x = 0; x < width; x++) {
+            let total = 0, count = 0;
+            for (let dz = -sRadius; dz <= sRadius; dz++) {
+                for (let dx = -sRadius; dx <= sRadius; dx++) {
+                    const nx = x + dx, nz = z + dz;
+                    if (nx >= 0 && nx < width && nz >= 0 && nz < length) {
+                        const d = Math.sqrt(dx * dx + dz * dz);
+                        const w = 1 / (1 + d);
+                        total += heightMap[nz * width + nx] * w;
+                        count += w;
                     }
                 }
             }
-            smoothedHeightMap[z * settings.width + x] =
-                (total / count) * settings.smoothing +
-                heightMap[z * settings.width + x] * (1 - settings.smoothing);
+            smoothedHeightMap[z * width + x] =
+                (total / count) * smoothing + heightMap[z * width + x] * (1 - smoothing);
         }
     }
 
+    // Erosion (soften peaks, create natural drainage)
     updateProgress("Applying erosion...", 15);
-    const erodedHeightMap = new Float32Array(settings.width * settings.length);
-    for (let z = 0; z < settings.length; z++) {
-        for (let x = 0; x < settings.width; x++) {
-            const index = z * settings.width + x;
-
-            if (settings.isCompletelyFlat) {
-
-                erodedHeightMap[index] = heightMap[index];
-                continue;
-            }
-            let height = Math.floor(
-                36 + smoothedHeightMap[index] * 28 * settings.roughness
-            );
-
+    const roughness = settings.roughness || 1.0;
+    const baseY = Math.max(4, seaLevel - 20);
+    const heightRange = Math.min(maxHeight - 12, 48) * roughness;
+    const erodedHeightMap = new Float32Array(width * length);
+    for (let z = 0; z < length; z++) {
+        for (let x = 0; x < width; x++) {
+            const idx = z * width + x;
+            if (settings.isCompletelyFlat) { erodedHeightMap[idx] = heightMap[idx]; continue; }
+            let h = Math.floor(baseY + smoothedHeightMap[idx] * heightRange);
             for (let dz = -1; dz <= 1; dz++) {
                 for (let dx = -1; dx <= 1; dx++) {
-                    const nx = x + dx;
-                    const nz = z + dz;
-                    if (
-                        nx >= 0 &&
-                        nx < settings.width &&
-                        nz >= 0 &&
-                        nz < settings.length
-                    ) {
-                        const neighborHeight = Math.floor(
-                            36 +
-                                smoothedHeightMap[nz * settings.width + nx] *
-                                    28 *
-                                    settings.roughness
-                        );
-
-                        if (neighborHeight < height - 1) {
-                            height = Math.max(height - 1, neighborHeight + 1);
-                        }
+                    const nx = x + dx, nz = z + dz;
+                    if (nx >= 0 && nx < width && nz >= 0 && nz < length) {
+                        const nh = Math.floor(baseY + smoothedHeightMap[nz * width + nx] * heightRange);
+                        if (nh < h - 1) h = Math.max(h - 1, nh + 1);
                     }
                 }
             }
-            erodedHeightMap[index] = (height - 36) / 28 / settings.roughness;
+            erodedHeightMap[idx] = (h - baseY) / heightRange;
         }
     }
 
-    updateProgress("Generating climate maps and biomes...", 20);
+    const finalHeightMap = settings.isCompletelyFlat ? heightMap : erodedHeightMap;
 
+    // -----------------------------------------------------------------------
+    // 2. Climate & Biomes -- scale tuned for min 3 biomes per seed
+    // -----------------------------------------------------------------------
+    updateProgress("Generating biomes...", 20);
 
-    const finalHeightMap = settings.isCompletelyFlat
-        ? heightMap
-        : erodedHeightMap;
-
-    const tempMap = generatePerlinNoise(settings.width, settings.length, {
-        octaveCount: 1,
-        scale: 0.005,
-        persistence: 0.5,
-        amplitude: 1.0,
-        seed: seedNum + 7,
+    const BIOME_SCALE = 0.028;
+    const tempMap = generatePerlinNoise(width, length, {
+        octaveCount: 1, scale: BIOME_SCALE, persistence: 0.5, amplitude: 1.0, seed: seedNum + 7,
+    });
+    const temperatureOffset = (settings.temperature || 0.5) - 0.5;
+    const humidityMap = generatePerlinNoise(width, length, {
+        octaveCount: 1, scale: BIOME_SCALE * 0.8, persistence: 0.5, amplitude: 1.0, seed: seedNum + 8,
     });
 
-    const temperatureOffset = (settings.temperature || 0.5) - 0.5; // Convert 0-1 to -0.5 to 0.5
-    const humidityMap = generatePerlinNoise(settings.width, settings.length, {
-        octaveCount: 1,
-        scale: 0.005,
-        persistence: 0.5,
-        amplitude: 1.0,
-        seed: seedNum + 8,
-    });
+    const biomeMap = new Array(width * length);
+    const biomeToggles = settings.biomeToggles || {};
+    const isBiomeEnabled = (b) => biomeToggles[b] !== false;
 
-    const riverNoise = generatePerlinNoise(settings.width, settings.length, {
-        octaveCount: 1,
-        scale: 0.01 + (settings.riverFreq || 0.05),
-        persistence: 0.5,
-        amplitude: 1.0,
-        seed: seedNum + 5,
-    });
-
-    const lakeNoise = generatePerlinNoise(settings.width, settings.length, {
-        octaveCount: 1,
-        scale: 0.02,
-        persistence: 0.5,
-        amplitude: 1.0,
-        seed: seedNum + 9,
-    });
-
-    const smoothedLakeNoise = new Float32Array(lakeNoise.length);
-    const lakeRadius = 2; // Smoothing radius
-    for (let z = 0; z < settings.length; z++) {
-        for (let x = 0; x < settings.width; x++) {
-            let total = 0;
-            let count = 0;
-
-            for (let dz = -lakeRadius; dz <= lakeRadius; dz++) {
-                for (let dx = -lakeRadius; dx <= lakeRadius; dx++) {
-                    const nx = x + dx;
-                    const nz = z + dz;
-                    if (
-                        nx >= 0 &&
-                        nx < settings.width &&
-                        nz >= 0 &&
-                        nz < settings.length
-                    ) {
-
-                        const distance = Math.sqrt(dx * dx + dz * dz);
-                        const weight = 1 / (1 + distance);
-                        total += lakeNoise[nz * settings.width + nx] * weight;
-                        count += weight;
-                    }
-                }
-            }
-            smoothedLakeNoise[z * settings.width + x] = total / count;
+    const fallbacks = {
+        snowy_plains: ["snowy_forest", "snowy_taiga", "plains"],
+        snowy_forest: ["snowy_taiga", "snowy_plains", "forest"],
+        snowy_taiga: ["snowy_forest", "snowy_plains", "taiga"],
+        plains: ["forest", "savanna"],
+        forest: ["taiga", "plains", "jungle"],
+        taiga: ["forest", "snowy_taiga", "plains"],
+        swamp: ["forest", "jungle", "plains"],
+        savanna: ["plains", "desert", "jungle"],
+        jungle: ["forest", "swamp", "savanna"],
+        desert: ["savanna", "plains"],
+        poplar_forest: ["forest", "taiga"],
+        cherry_grove: ["forest", "plains"],
+    };
+    const getFallback = (b) => {
+        for (const fb of (fallbacks[b] || ["plains"])) {
+            if (isBiomeEnabled(fb)) return fb;
         }
-    }
+        return "plains";
+    };
 
-    const biomeMap = new Array(settings.width * settings.length);
-    for (let z = 0; z < settings.length; z++) {
-        for (let x = 0; x < settings.width; x++) {
-            const index = z * settings.width + x;
-            const temp = tempMap[index] + temperatureOffset; // Apply temperature offset
-            const humidity = humidityMap[index];
+    const humidityOffset = settings.humidityOffset ?? 0;
+    const biomeEmphasis = settings.biomeEmphasis || {};
+
+    for (let z = 0; z < length; z++) {
+        for (let x = 0; x < width; x++) {
+            const idx = z * width + x;
+            const temp = tempMap[idx] + temperatureOffset;
+            const hum = humidityMap[idx] + humidityOffset;
+            let biome;
 
             if (temp < 0.2) {
-
-                if (humidity < 0.3) biomeMap[index] = "snowy_plains";
-                else if (humidity < 0.6) biomeMap[index] = "snowy_forest";
-                else biomeMap[index] = "snowy_taiga";
+                biome = hum < 0.3 ? "snowy_plains" : hum < 0.6 ? "snowy_forest" : "snowy_taiga";
             } else if (temp < 0.4) {
-
-                if (humidity < 0.3) biomeMap[index] = "plains";
-                else if (humidity < 0.6) biomeMap[index] = "forest";
-                else biomeMap[index] = "taiga";
+                biome = hum < 0.3 ? "plains" : hum < 0.6 ? "forest" : "taiga";
             } else if (temp < 0.6) {
-
-                if (humidity < 0.3) biomeMap[index] = "plains";
-                else if (humidity < 0.6) biomeMap[index] = "forest";
-                else biomeMap[index] = "swamp";
+                biome = hum < 0.3 ? "plains" : hum < 0.6 ? "forest" : "swamp";
             } else if (temp < 0.8) {
-
-                if (humidity < 0.3) biomeMap[index] = "savanna";
-                else if (humidity < 0.6) biomeMap[index] = "jungle";
-                else biomeMap[index] = "swamp";
+                biome = hum < 0.3 ? "savanna" : hum < 0.6 ? "jungle" : "swamp";
             } else {
-
-                if (humidity < 0.3) biomeMap[index] = "desert";
-                else if (humidity < 0.6) biomeMap[index] = "savanna";
-                else biomeMap[index] = "jungle";
+                biome = hum < 0.3 ? "desert" : hum < 0.6 ? "savanna" : "jungle";
             }
+
+            if (!isBiomeEnabled(biome)) biome = getFallback(biome);
+
+            // Special biome replacement for variety (seed-driven emphasis)
+            const isForesty = ["forest", "taiga", "snowy_forest", "snowy_taiga"].includes(biome);
+            const poplarBoost = (biomeEmphasis["poplar_forest"] || 1) - 1;
+            const cherryBoost = (biomeEmphasis["cherry_grove"] || 1) - 1;
+            if (isForesty) {
+                if (temp < 0.5 && rng() < 0.3 + poplarBoost * 0.3 && isBiomeEnabled("poplar_forest")) biome = "poplar_forest";
+                else if (temp >= 0.5 && rng() < 0.25 + cherryBoost * 0.3 && isBiomeEnabled("cherry_grove")) biome = "cherry_grove";
+            }
+            // Seed-emphasized biomes (min 3 per seed): chance to override for diversity
+            const emphList = Object.entries(biomeEmphasis).filter(([, w]) => w > 1.1);
+            for (const [eb, weight] of emphList) {
+                if (eb === biome || !isBiomeEnabled(eb)) continue;
+                const roll = rng();
+                if (roll < (weight - 1) * 0.22) {
+                    biome = eb;
+                    break;
+                }
+            }
+
+            biomeMap[idx] = biome;
         }
     }
 
+    // Biome transition smoothing (soften boundaries)
+    const biomeCopy = [...biomeMap];
+    for (let z = 1; z < length - 1; z++) {
+        for (let x = 1; x < width - 1; x++) {
+            const idx = z * width + x;
+            const center = biomeMap[idx];
+            const neighbors = [];
+            for (let dz = -1; dz <= 1; dz++)
+                for (let dx = -1; dx <= 1; dx++)
+                    if (dx || dz) neighbors.push(biomeMap[(z + dz) * width + (x + dx)]);
+            const different = neighbors.filter((b) => b !== center);
+            if (different.length > 0 && rng() < 0.2) {
+                biomeCopy[idx] = different[Math.floor(rng() * different.length)];
+            }
+        }
+    }
+    for (let i = 0; i < biomeMap.length; i++) biomeMap[i] = biomeCopy[i];
+
+    // -----------------------------------------------------------------------
+    // 3. River & Lake noise
+    // -----------------------------------------------------------------------
+    const riverNoise = generatePerlinNoise(width, length, {
+        octaveCount: 1, scale: 0.01 + (settings.riverFreq || 0.05),
+        persistence: 0.5, amplitude: 1.0, seed: seedNum + 5,
+    });
+    const lakeNoise = generatePerlinNoise(width, length, {
+        octaveCount: 1, scale: 0.02, persistence: 0.5, amplitude: 1.0, seed: seedNum + 9,
+    });
+    // Smooth lake noise
+    const smoothedLakeNoise = new Float32Array(lakeNoise.length);
+    for (let z = 0; z < length; z++) {
+        for (let x = 0; x < width; x++) {
+            let t = 0, c = 0;
+            for (let dz = -2; dz <= 2; dz++) {
+                for (let dx = -2; dx <= 2; dx++) {
+                    const nx = x + dx, nz = z + dz;
+                    if (nx >= 0 && nx < width && nz >= 0 && nz < length) {
+                        const d = Math.sqrt(dx * dx + dz * dz);
+                        const w = 1 / (1 + d);
+                        t += lakeNoise[nz * width + nx] * w;
+                        c += w;
+                    }
+                }
+            }
+            smoothedLakeNoise[z * width + x] = t / c;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 4. 3D Density Field & Block Placement
+    // -----------------------------------------------------------------------
     updateProgress("Building terrain layers...", 25);
 
-    const startX = -Math.floor(settings.width / 2);
-    const startZ = -Math.floor(settings.length / 2);
-
     const densityField = generate3DDensityField(
-        settings.width,
-        settings.maxHeight,
-        settings.length,
-        worldSettings,
-        seedNum,
-        biomeMap,
-        finalHeightMap,
-        settings.isCompletelyFlat
+        width, maxHeight, length, worldSettings, seedNum, biomeMap, finalHeightMap, settings.isCompletelyFlat
     );
 
-    updateProgress("Building world from density field...", 45);
-    const terrainData = {};
+    updateProgress("Building world from density field...", 40);
+    const blockStore = new RegionBlockStore();
+    const terrainData = asTerrainDataProxy(blockStore);
     let blocksCount = 0;
+    const hollowWorld = settings.hollowWorld === true;
 
-    for (let z = 0; z < settings.length; z++) {
-        for (let x = 0; x < settings.width; x++) {
+    for (let z = 0; z < length; z++) {
+        for (let x = 0; x < width; x++) {
             const worldX = startX + x;
             const worldZ = startZ + z;
-            const biomeIndex = z * settings.width + x;
-            const biome = biomeMap[biomeIndex];
+            const biIdx = z * width + x;
+            const biome = biomeMap[biIdx];
+            const rv = rockNoise[biIdx];
 
-            console.log("Adding lava bedrock layer at y=0");
-            terrainData[`${worldX},0,${worldZ}`] = blockTypes.lava; // Use lava for the bottom layer
-            blocksCount++;
-
+            // Find surface
             let surfaceHeight = 0;
-            for (let y = settings.maxHeight - 1; y > 0; y--) {
-                const index =
-                    z * settings.width * settings.maxHeight +
-                    y * settings.width +
-                    x;
-                const aboveIndex =
-                    z * settings.width * settings.maxHeight +
-                    (y + 1) * settings.width +
-                    x;
-
-                if (
-                    densityField[index] >= 0 &&
-                    (y === settings.maxHeight - 1 ||
-                        densityField[aboveIndex] < 0)
-                ) {
+            for (let y = maxHeight - 1; y > 0; y--) {
+                const di = z * width * maxHeight + y * width + x;
+                const ai = z * width * maxHeight + (y + 1) * width + x;
+                if (densityField[di] >= 0 && (y === maxHeight - 1 || densityField[ai] < 0)) {
                     surfaceHeight = y;
                     break;
                 }
             }
 
-            for (let y = 1; y < settings.maxHeight; y++) {
-                const index =
-                    z * settings.width * settings.maxHeight +
-                    y * settings.width +
-                    x;
-                if (densityField[index] >= 0) {
-
-
-                    if (y === 0) {
-
-                        continue;
-                    } else if (y < surfaceHeight - 3) {
-                        terrainData[`${worldX},${y},${worldZ}`] =
-                            blockTypes.stone; // Deep terrain
-                    } else if (y < surfaceHeight) {
-
-                        if (biome === "desert" || biome === "savanna") {
-                            terrainData[`${worldX},${y},${worldZ}`] =
-                                blockTypes.sand;
-                        } else if (
-                            biome === "snowy_plains" ||
-                            biome === "snowy_forest" ||
-                            biome === "snowy_taiga"
-                        ) {
-                            terrainData[`${worldX},${y},${worldZ}`] =
-                                blockTypes.snow;
-                        } else if (
-                            biome === "ocean" &&
-                            y < worldSettings.seaLevel
-                        ) {
-                            terrainData[`${worldX},${y},${worldZ}`] =
-                                blockTypes.gravel; // Underwater surface
-                        } else {
-
-                            const rockValue = rockNoise[z * settings.width + x];
-                            if (rockValue > 0.8) {
-                                terrainData[`${worldX},${y},${worldZ}`] =
-                                    blockTypes.cobblestone;
-                            } else {
-                                terrainData[`${worldX},${y},${worldZ}`] =
-                                    blockTypes.dirt;
-                            }
-                        }
+            if (hollowWorld) {
+                // Hollow: only topsoil (surface + 1–2 subsurface layers), no rock or bedrock
+                const topsoilDepth = 2;
+                for (let y = Math.max(0, surfaceHeight - topsoilDepth); y <= surfaceHeight; y++) {
+                    const di = z * width * maxHeight + y * width + x;
+                    if (densityField[di] < 0) continue;
+                    if (y === surfaceHeight) {
+                        terrainData[`${worldX},${y},${worldZ}`] = getSurfaceBlock(
+                            biome, blockTypes, rv, settings.cobblestoneFeatures
+                        );
                     } else {
+                        terrainData[`${worldX},${y},${worldZ}`] = getSubSurfaceBlock(
+                            biome, blockTypes, surfaceHeight - y
+                        );
+                    }
+                    blocksCount++;
+                }
+            } else {
+                // Normal: bedrock at y=0,1 + full terrain
+                const bedrockId = blockTypes.deepslate || blockTypes["lava-stone"] || blockTypes.stone;
+                terrainData[`${worldX},0,${worldZ}`] = bedrockId;
+                terrainData[`${worldX},1,${worldZ}`] = bedrockId;
+                blocksCount += 2;
 
-                        if (biome === "desert" || biome === "savanna") {
-                            terrainData[`${worldX},${y},${worldZ}`] =
-                                blockTypes.sand;
-                        } else if (
-                            biome === "snowy_plains" ||
-                            biome === "snowy_forest" ||
-                            biome === "snowy_taiga"
-                        ) {
-                            terrainData[`${worldX},${y},${worldZ}`] =
-                                blockTypes.snow;
-                        } else if (
-                            biome === "ocean" &&
-                            y < worldSettings.seaLevel
-                        ) {
-                            terrainData[`${worldX},${y},${worldZ}`] =
-                                blockTypes.gravel; // Underwater surface
-                        } else {
+                const mantleFactor = settings.mantleThicknessFactor || 1.0;
+                const surfaceDepth = Math.max(1, Math.round(3 * mantleFactor));
+                const stoneStartY = surfaceHeight - surfaceDepth;
 
-                            const rockValue = rockNoise[z * settings.width + x];
-                            if (rockValue > 0.8) {
-                                terrainData[`${worldX},${y},${worldZ}`] =
-                                    blockTypes.cobblestone;
-                            } else {
-                                terrainData[`${worldX},${y},${worldZ}`] =
-                                    blockTypes.grass;
-                            }
-                        }
+                for (let y = 2; y < maxHeight; y++) {
+                    const di = z * width * maxHeight + y * width + x;
+                    if (densityField[di] < 0) continue;
+
+                    if (y === surfaceHeight) {
+                        terrainData[`${worldX},${y},${worldZ}`] = getSurfaceBlock(
+                            biome, blockTypes, rv, settings.cobblestoneFeatures
+                        );
+                    } else if (y >= stoneStartY && y < surfaceHeight) {
+                        terrainData[`${worldX},${y},${worldZ}`] = getSubSurfaceBlock(
+                            biome, blockTypes, surfaceHeight - y
+                        );
+                    } else {
+                        terrainData[`${worldX},${y},${worldZ}`] = getStoneBlock(blockTypes, y, rng);
                     }
                     blocksCount++;
                 }
             }
         }
 
-        if (z % Math.ceil(settings.length / 10) === 0) {
-            const progress = Math.floor(45 + (z / settings.length) * 15);
-            updateProgress(
-                `Building terrain: ${Math.floor((z / settings.length) * 100)}% complete`,
-                progress
-            );
+        if (z % Math.ceil(length / 10) === 0) {
+            updateProgress(`Building terrain: ${Math.floor((z / length) * 100)}%`, 40 + (z / length) * 15);
         }
     }
 
-    updateProgress("Creating natural water bodies...", 65);
+    // -----------------------------------------------------------------------
+    // 5. Water Bodies
+    // -----------------------------------------------------------------------
+    updateProgress("Creating water bodies...", 60);
 
     const waterMap = {};
     const surfaceHeightMap = {};
-    const waterBedHeightMap = {}; // Track water bed heights for cleanup
+    const waterBedHeightMap = {};
 
-    for (let z = 0; z < settings.length; z++) {
-        for (let x = 0; x < settings.width; x++) {
-            const worldX = startX + x;
-            const worldZ = startZ + z;
-            const index = z * settings.width + x;
-            const biome = biomeMap[index];
-
-            let surfaceHeight = 0;
-            for (let y = settings.maxHeight - 1; y > 0; y--) {
-                const key = `${worldX},${y},${worldZ}`;
-                if (
-                    terrainData[key] &&
-                    terrainData[key] !== blockTypes["water-still"]
-                ) {
-                    surfaceHeight = y;
-                    break;
-                }
+    for (let z = 0; z < length; z++) {
+        for (let x = 0; x < width; x++) {
+            const worldX = startX + x, worldZ = startZ + z;
+            const biome = biomeMap[z * width + x];
+            let sh = 0;
+            for (let y = maxHeight - 1; y > 0; y--) {
+                const k = `${worldX},${y},${worldZ}`;
+                if (terrainData[k] && terrainData[k] !== blockTypes["water-still"]) { sh = y; break; }
             }
-
-            const key = `${worldX},${worldZ}`;
-            surfaceHeightMap[key] = surfaceHeight;
-
-            waterMap[key] = biome === "ocean";
+            const k2 = `${worldX},${worldZ}`;
+            surfaceHeightMap[k2] = sh;
+            waterMap[k2] = biome === "ocean";
         }
     }
 
-    for (let z = 1; z < settings.length - 1; z++) {
-        for (let x = 1; x < settings.width - 1; x++) {
-            const worldX = startX + x;
-            const worldZ = startZ + z;
-            const key = `${worldX},${worldZ}`;
-            const height = surfaceHeightMap[key];
-            const index = z * settings.width + x;
+    // Water: only deep depressions get initial water (avoid flat seas)
+    const deepWaterLevel = seaLevel - 4;
+    for (let z = 0; z < length; z++) {
+        for (let x = 0; x < width; x++) {
+            const k = `${startX + x},${startZ + z}`;
+            const h = surfaceHeightMap[k];
+            if (h < deepWaterLevel) waterMap[k] = true;
+        }
+    }
 
-            if (waterMap[key] || height > worldSettings.seaLevel) continue;
+    // Lakes: only in clear deep basins (strict - avoid flat water seas)
+    for (let z = 2; z < length - 2; z++) {
+        for (let x = 2; x < width - 2; x++) {
+            const wX = startX + x, wZ = startZ + z;
+            const k = `${wX},${wZ}`;
+            if (waterMap[k] || surfaceHeightMap[k] > seaLevel - 1) continue;
 
-            const lakeValue = smoothedLakeNoise[index];
+            const lv = smoothedLakeNoise[z * width + x];
+            if (lv < 0.88) continue;
 
-            if (lakeValue > 0.7 && height < worldSettings.seaLevel - 1) {
-                waterMap[key] = true;
-                continue;
-            }
-
-            let isDepression = true;
-            let lowestNeighborHeight = Infinity;
-
-            for (let dz = -1; dz <= 1; dz++) {
-                for (let dx = -1; dx <= 1; dx++) {
-                    if (dx === 0 && dz === 0) continue;
-                    const nx = worldX + dx;
-                    const nz = worldZ + dz;
-                    const nKey = `${nx},${nz}`;
-
-                    if (!surfaceHeightMap[nKey]) continue;
-                    const neighborHeight = surfaceHeightMap[nKey];
-
-                    if (neighborHeight < height) {
-                        isDepression = false;
-                    }
-
-                    if (neighborHeight < lowestNeighborHeight) {
-                        lowestNeighborHeight = neighborHeight;
-                    }
+            let minNeighbor = 999;
+            for (let dz = -2; dz <= 2; dz++) {
+                for (let dx = -2; dx <= 2; dx++) {
+                    if (!dx && !dz) continue;
+                    const nk = `${wX + dx},${wZ + dz}`;
+                    const nh = surfaceHeightMap[nk];
+                    if (nh !== undefined && nh < minNeighbor) minNeighbor = nh;
                 }
             }
-
-            if (isDepression && height < worldSettings.seaLevel) {
-                waterMap[key] = true;
-            }
-
-            else if (height < worldSettings.seaLevel - 2) {
-                let higherNeighbors = 0;
-                for (let dz = -1; dz <= 1; dz++) {
-                    for (let dx = -1; dx <= 1; dx++) {
-                        if (dx === 0 && dz === 0) continue;
-                        const nx = worldX + dx;
-                        const nz = worldZ + dz;
-                        const nKey = `${nx},${nz}`;
-
-                        if (!surfaceHeightMap[nKey]) continue;
-
-                        if (surfaceHeightMap[nKey] >= height + 2) {
-                            higherNeighbors++;
-                        }
-                    }
-                }
-
-                if (higherNeighbors >= 5) {
-                    waterMap[key] = true;
-                }
+            if (surfaceHeightMap[k] < minNeighbor + 2 && surfaceHeightMap[k] < seaLevel - 2) {
+                waterMap[k] = true;
             }
         }
     }
 
-    for (let i = 0; i < 3; i++) {
-
-        const newWaterMap = { ...waterMap };
-        for (let z = 1; z < settings.length - 1; z++) {
-            for (let x = 1; x < settings.width - 1; x++) {
-                const worldX = startX + x;
-                const worldZ = startZ + z;
-                const key = `${worldX},${worldZ}`;
-                const height = surfaceHeightMap[key];
-
-                if (waterMap[key] || height > worldSettings.seaLevel) continue;
-
-                let adjacentToWater = false;
-                for (let dz = -1; dz <= 1; dz++) {
-                    for (let dx = -1; dx <= 1; dx++) {
-                        if (dx === 0 && dz === 0) continue;
-                        const nx = worldX + dx;
-                        const nz = worldZ + dz;
-                        const nKey = `${nx},${nz}`;
-                        if (waterMap[nKey]) {
-                            adjacentToWater = true;
-                            break;
-                        }
+    // Flood fill (1 pass - minimal expansion to avoid flat water seas)
+    for (let iter = 0; iter < 1; iter++) {
+        const newW = { ...waterMap };
+        for (let z = 1; z < length - 1; z++) {
+            for (let x = 1; x < width - 1; x++) {
+                const wX = startX + x, wZ = startZ + z;
+                const k = `${wX},${wZ}`;
+                if (waterMap[k] || surfaceHeightMap[k] > seaLevel) continue;
+                let adj = false;
+                for (let dz = -1; !adj && dz <= 1; dz++)
+                    for (let dx = -1; !adj && dx <= 1; dx++) {
+                        if (!dx && !dz) continue;
+                        if (waterMap[`${wX + dx},${wZ + dz}`]) adj = true;
                     }
-                    if (adjacentToWater) break;
-                }
-
-                if (adjacentToWater && height <= worldSettings.seaLevel) {
-                    newWaterMap[key] = true;
-                }
+                if (adj && surfaceHeightMap[k] <= seaLevel) newW[k] = true;
             }
         }
-
-        Object.assign(waterMap, newWaterMap);
+        Object.assign(waterMap, newW);
     }
 
-    for (let z = 0; z < settings.length; z++) {
-        for (let x = 0; x < settings.width; x++) {
-            const worldX = startX + x;
-            const worldZ = startZ + z;
-            const key = `${worldX},${worldZ}`;
-            const surfaceHeight = surfaceHeightMap[key];
-            const biome = biomeMap[z * settings.width + x];
+    // Place water blocks + beaches
+    for (let z = 0; z < length; z++) {
+        for (let x = 0; x < width; x++) {
+            const wX = startX + x, wZ = startZ + z;
+            const k = `${wX},${wZ}`;
+            const sh = surfaceHeightMap[k];
 
-            if (waterMap[key] && surfaceHeight < worldSettings.seaLevel) {
-
-
-                let waterBedHeight = surfaceHeight;
-
-                let totalHeight = surfaceHeight;
-                let countNeighbors = 1; // Include this cell
-                for (let dz = -1; dz <= 1; dz++) {
+            if (waterMap[k] && sh < seaLevel) {
+                let bed = sh;
+                let tt = sh, cc = 1;
+                for (let dz = -1; dz <= 1; dz++)
                     for (let dx = -1; dx <= 1; dx++) {
-                        if (dx === 0 && dz === 0) continue;
-                        const nx = worldX + dx;
-                        const nz = worldZ + dz;
-                        const nKey = `${nx},${nz}`;
-                        if (surfaceHeightMap[nKey] !== undefined) {
-                            totalHeight += surfaceHeightMap[nKey];
-                            countNeighbors++;
-                        }
+                        if (!dx && !dz) continue;
+                        const nk = `${wX + dx},${wZ + dz}`;
+                        if (surfaceHeightMap[nk] !== undefined) { tt += surfaceHeightMap[nk]; cc++; }
                     }
-                }
+                bed = Math.max(sh - 2, Math.floor(tt / cc));
+                waterBedHeightMap[k] = bed;
 
-                const smoothedHeight = Math.floor(totalHeight / countNeighbors);
-                waterBedHeight = Math.max(surfaceHeight - 2, smoothedHeight);
-
-                waterBedHeightMap[key] = waterBedHeight;
-
-                for (
-                    let y = waterBedHeight + 1;
-                    y <= worldSettings.seaLevel;
-                    y++
-                ) {
-                    terrainData[`${worldX},${y},${worldZ}`] =
-                        blockTypes["water-still"];
+                for (let y = bed + 1; y <= seaLevel; y++) {
+                    terrainData[`${wX},${y},${wZ}`] = blockTypes["water-still"];
                     blocksCount++;
                 }
 
-                const waterDepth = worldSettings.seaLevel - waterBedHeight;
-                if (waterDepth > 3) {
-
-                    terrainData[`${worldX},${waterBedHeight},${worldZ}`] =
-                        Math.random() < 0.6
-                            ? blockTypes.gravel
-                            : blockTypes.clay;
-                } else {
-
-                    terrainData[`${worldX},${waterBedHeight},${worldZ}`] =
-                        blockTypes.sand;
-                }
-
-                for (let y = waterBedHeight + 1; y <= surfaceHeight; y++) {
-                    delete terrainData[`${worldX},${y},${worldZ}`];
-                }
+                // Bottom material
+                const depth = seaLevel - bed;
+                terrainData[`${wX},${bed},${wZ}`] = depth > 3
+                    ? (blockTypes["sand-wet"] || blockTypes.sand)
+                    : blockTypes.sand;
             }
 
-            if (!waterMap[key]) {
-
-                let adjacentToWater = false;
-                for (let dz = -1; dz <= 1; dz++) {
-                    for (let dx = -1; dx <= 1; dx++) {
-                        if (dx === 0 && dz === 0) continue;
-                        const nx = worldX + dx;
-                        const nz = worldZ + dz;
-                        const nKey = `${nx},${nz}`;
-                        if (waterMap[nKey]) {
-                            adjacentToWater = true;
-                            break;
-                        }
+            // Beaches
+            if (!waterMap[k]) {
+                let adjW = false;
+                for (let dz = -1; !adjW && dz <= 1; dz++)
+                    for (let dx = -1; !adjW && dx <= 1; dx++) {
+                        if (!dx && !dz) continue;
+                        if (waterMap[`${wX + dx},${wZ + dz}`]) adjW = true;
                     }
-                    if (adjacentToWater) break;
-                }
-
-                if (
-                    adjacentToWater &&
-                    surfaceHeight >= worldSettings.seaLevel - 2 &&
-                    surfaceHeight <= worldSettings.seaLevel + 1
-                ) {
-
-                    terrainData[`${worldX},${surfaceHeight},${worldZ}`] =
-                        Math.random() < 0.7
-                            ? blockTypes.sand
-                            : blockTypes["sand-light"];
-
-                    if (Math.random() < 0.5 && surfaceHeight > 1) {
-                        terrainData[
-                            `${worldX},${surfaceHeight - 1},${worldZ}`
-                        ] = blockTypes.sand;
-                    }
+                if (adjW && sh >= seaLevel - 2 && sh <= seaLevel + 1) {
+                    terrainData[`${wX},${sh},${wZ}`] = blockTypes.sand;
+                    if (rng() < 0.7 && sh > 1) terrainData[`${wX},${sh - 1},${wZ}`] = blockTypes.sand;
+                    if (rng() < 0.4 && sh > 1) terrainData[`${wX},${sh - 2},${wZ}`] = blockTypes.sand;
                 }
             }
         }
     }
-
-    if (riverNoise) {
-
-        for (let z = 0; z < settings.length; z++) {
-            for (let x = 0; x < settings.width; x++) {
-                const worldX = startX + x;
-                const worldZ = startZ + z;
-                const key = `${worldX},${worldZ}`;
-                const index = z * settings.width + x;
-
-                if (waterMap[key]) continue;
-
-                const riverVal = riverNoise[index];
-                if (riverVal > 0.47 && riverVal < 0.53) {
-                    const height = surfaceHeightMap[key];
-
-                    if (height <= worldSettings.seaLevel + 4) {
-
-
-                        const riverDepth = Math.min(
-                            2,
-                            Math.max(
-                                1,
-                                Math.floor(
-                                    (height - worldSettings.seaLevel) * 0.3
-                                ) + 1
-                            )
-                        );
-                        const waterHeight = Math.max(
-                            height - riverDepth,
-                            Math.min(worldSettings.seaLevel, height - 1)
-                        );
-
-                        if (waterHeight > 0 && waterHeight < height) {
-
-                            for (let y = waterHeight; y <= height; y++) {
-
-                                if (y >= height - 2) {
-                                    delete terrainData[
-                                        `${worldX},${y},${worldZ}`
-                                    ];
-                                }
-                            }
-
-                            if (waterHeight <= worldSettings.seaLevel) {
-                                terrainData[
-                                    `${worldX},${waterHeight},${worldZ}`
-                                ] = blockTypes["water-still"];
-                                blocksCount++;
-
-                                waterMap[key] = true;
-                                waterBedHeightMap[key] = waterHeight;
-                            }
-
-                            for (let dx = -1; dx <= 1; dx++) {
-                                for (let dz = -1; dz <= 1; dz++) {
-                                    if (dx === 0 && dz === 0) continue;
-                                    const nx = worldX + dx;
-                                    const nz = worldZ + dz;
-                                    const nKey = `${nx},${nz}`;
-
-                                    if (waterMap[nKey]) continue;
-                                    const bankHeight = surfaceHeightMap[nKey];
-                                    if (
-                                        bankHeight > 0 &&
-                                        bankHeight <= waterHeight + 2
-                                    ) {
-
-                                        terrainData[
-                                            `${nx},${bankHeight},${nz}`
-                                        ] =
-                                            Math.random() < 0.6
-                                                ? blockTypes.sand
-                                                : blockTypes.dirt;
-                                    }
-                                }
-                            }
-                        }
-                    }
+    // Extend beaches one block inland
+    for (let z = 1; z < length - 1; z++) {
+        for (let x = 1; x < width - 1; x++) {
+            const wX = startX + x, wZ = startZ + z;
+            const k = `${wX},${wZ}`;
+            if (waterMap[k]) continue;
+            const sh = surfaceHeightMap[k];
+            if (sh == null || sh < seaLevel - 1 || sh > seaLevel + 2) continue;
+            let adjBeach = false;
+            for (let dz = -1; !adjBeach && dz <= 1; dz++)
+                for (let dx = -1; !adjBeach && dx <= 1; dx++) {
+                    if (!dx && !dz) continue;
+                    const nsh = surfaceHeightMap[`${wX + dx},${wZ + dz}`];
+                    if (nsh != null && terrainData[`${wX + dx},${nsh},${wZ + dz}`] === blockTypes.sand) adjBeach = true;
                 }
-            }
+            if (adjBeach && rng() < 0.6) terrainData[`${wX},${sh},${wZ}`] = blockTypes.sand;
         }
     }
 
-    updateProgress("Preparing cave systems...", 75);
-    const smallCaveNoise = generatePerlinNoise3D(
-        settings.width,
-        settings.maxHeight,
-        settings.length,
-        {
-            octaveCount: 2,
-            scale: 0.03,
-            persistence: 0.5,
-            amplitude: 1.0,
-            seed: seedNum + 2,
-        }
-    );
-    const largeCaveNoise = generatePerlinNoise3D(
-        settings.width,
-        settings.maxHeight,
-        settings.length,
-        {
-            octaveCount: 2,
-            scale: 0.06,
-            persistence: 0.5,
-            amplitude: 1.0,
-            seed: seedNum + 3,
-        }
-    );
-
-    const oreNoise = generatePerlinNoise3D(
-        settings.width,
-        settings.maxHeight,
-        settings.length,
-        {
-            octaveCount: 1,
-            scale: 0.04,
-            persistence: 0.5,
-            amplitude: 1.0,
-            seed: seedNum + 4,
-        }
-    );
-
-    updateProgress("Carving cave systems...", 80);
-    for (let z = 0; z < settings.length; z++) {
-        for (let x = 0; x < settings.width; x++) {
-            const worldX = startX + x;
-            const worldZ = startZ + z;
-            const key = `${worldX},${worldZ}`;
-
-            const surfaceHeight = surfaceHeightMap[key] || 0;
-
-            for (
-                let y = Math.min(surfaceHeight - 2, settings.maxHeight - 3);
-                y > 1;
-                y--
-            ) {
-                const blockKey = `${worldX},${y},${worldZ}`;
-
-                if (
-                    !terrainData[blockKey] ||
-                    terrainData[blockKey] !== blockTypes.stone
-                )
-                    continue;
-
-                const index =
-                    z * settings.width * settings.maxHeight +
-                    y * settings.width +
-                    x;
-                const smallCaveValue = smallCaveNoise[index];
-                const largeCaveValue = largeCaveNoise[index];
-
-                if (
-                    (smallCaveValue > 0.6 && largeCaveValue > 0.5) ||
-                    smallCaveValue > 0.7 ||
-                    largeCaveValue > 0.65
-                ) {
-                    delete terrainData[blockKey]; // Remove block to create cave
-                }
-
-                else if (terrainData[blockKey] === blockTypes.stone) {
-                    const oreValue = oreNoise[index];
-                    const oreRarity = settings.oreRarity || 0.78; // Default if not specified
-
-                    if (settings.generateOres !== false) {
-                        if (oreValue > oreRarity + 0.12 && y <= 40) {
-                            terrainData[blockKey] = blockTypes.coal;
-                        } else if (oreValue > oreRarity + 0.07 && y <= 35) {
-                            terrainData[blockKey] = blockTypes.iron;
-                        } else if (oreValue > oreRarity + 0.04 && y <= 20) {
-                            terrainData[blockKey] = blockTypes.gold;
-                        } else if (
-                            oreValue > oreRarity + 0.02 &&
-                            y <= 30 &&
-                            Math.random() < 0.3
-                        ) {
-                            terrainData[blockKey] = blockTypes.emerald;
-                        } else if (oreValue > oreRarity && y <= 15) {
-                            terrainData[blockKey] = blockTypes.diamond;
-                        }
-                    }
-                }
-            }
-        }
-
-        if (z % Math.ceil(settings.length / 10) === 0) {
-            const progress = Math.floor(80 + (z / settings.length) * 5);
-            updateProgress(
-                `Generating caves and ores: ${Math.floor((z / settings.length) * 100)}% complete`,
-                progress
-            );
-        }
-    }
-
-    updateProgress("Smoothing underwater terrain...", 88);
-
-    for (let z = 0; z < settings.length; z++) {
-        for (let x = 0; x < settings.width; x++) {
-            const worldX = startX + x;
-            const worldZ = startZ + z;
-            const key = `${worldX},${worldZ}`;
-
-            if (!waterMap[key] || !waterBedHeightMap[key]) continue;
-            const waterBedHeight = waterBedHeightMap[key];
-
-            for (let y = waterBedHeight - 1; y > 0; y--) {
-
-                const currentBlockKey = `${worldX},${y},${worldZ}`;
-
-                if (!terrainData[currentBlockKey]) continue;
-
-                let adjacentBlocks = 0;
-                let adjacentWater = 0;
-                for (let dz = -1; dz <= 1; dz++) {
-                    for (let dx = -1; dx <= 1; dx++) {
-                        if (dx === 0 && dz === 0) continue;
-                        const nx = worldX + dx;
-                        const nz = worldZ + dz;
-                        const nKey = `${nx},${nz}`;
-                        const neighborBlockKey = `${nx},${y},${nz}`;
-
-                        if (terrainData[neighborBlockKey]) {
-                            adjacentBlocks++;
-                        }
-
-                        if (waterMap[nKey]) {
-                            adjacentWater++;
-                        }
-                    }
-                }
-
-
-                const heightFactor = (y - 1) / waterBedHeight; // 0 near bottom, close to 1 near waterbed
-                const threshold = Math.floor(2 + 3 * heightFactor); // 2-5 based on depth
-                if (adjacentBlocks <= threshold && adjacentWater >= 4) {
-                    delete terrainData[currentBlockKey];
-                }
-            }
-        }
-    }
-
-    updateProgress("Adding biome-specific features...", 90);
-
-    if (settings.mountainRange && settings.mountainRange.enabled) {
-        updateProgress(
-            "Creating snow-capped mountain ranges along world borders...",
-            92
-        );
-
-
-        const sizeAdjustmentFactor = Math.max(
-            0.05,
-            1.0 - settings.mountainRange.size * 4.0
-        );
-
-
-        const mountainBaseHeight =
-            settings.mountainRange.height *
-            2 *
-            (1 + sizeAdjustmentFactor * 0.5);
-        const snowHeight = settings.mountainRange.snowHeight * 1.5; // Adjust snow line accordingly
-
-
-        const mountainWidth = Math.max(
-            5,
-            Math.floor(settings.width * 0.25 * sizeAdjustmentFactor)
-        );
-        console.log(
-            `Generating mountain ranges around all borders: width ${mountainWidth}, height ${mountainBaseHeight}, snow at ${snowHeight}, size adjustment ${sizeAdjustmentFactor}`
-        );
-
-        for (let z = 0; z < settings.length; z++) {
-            for (let x = 0; x < settings.width; x++) {
-                const worldX = startX + x;
-                const worldZ = startZ + z;
-
-                const distFromWest = x;
-                const distFromEast = settings.width - x - 1;
-                const distFromNorth = z;
-                const distFromSouth = settings.length - z - 1;
-
-                const distFromEdge = Math.min(
-                    distFromWest,
-                    distFromEast,
-                    distFromNorth,
-                    distFromSouth
-                );
-
-                if (distFromEdge > mountainWidth) continue;
-
-                const isNearWest = distFromWest <= mountainWidth;
-                const isNearEast = distFromEast <= mountainWidth;
-                const isNearNorth = distFromNorth <= mountainWidth;
-                const isNearSouth = distFromSouth <= mountainWidth;
-
-
-                let heightFactor = Math.cos(
-                    (distFromEdge / mountainWidth) * (Math.PI * 0.5)
-                );
-
-                let cornerBoost = 0;
-
-                if (
-                    (isNearWest && isNearNorth) ||
-                    (isNearWest && isNearSouth) ||
-                    (isNearEast && isNearNorth) ||
-                    (isNearEast && isNearSouth)
-                ) {
-
-                    let edgeDist1, edgeDist2;
-                    if (isNearWest && isNearNorth) {
-                        edgeDist1 = distFromWest;
-                        edgeDist2 = distFromNorth;
-                    } else if (isNearWest && isNearSouth) {
-                        edgeDist1 = distFromWest;
-                        edgeDist2 = distFromSouth;
-                    } else if (isNearEast && isNearNorth) {
-                        edgeDist1 = distFromEast;
-                        edgeDist2 = distFromNorth;
-                    } else {
-                        edgeDist1 = distFromEast;
-                        edgeDist2 = distFromSouth;
-                    }
-
-                    const cornerFactor =
-                        (1.0 - edgeDist1 / mountainWidth) *
-                        (1.0 - edgeDist2 / mountainWidth);
-                    cornerBoost = cornerFactor * 0.4; // Boost corner height
-                }
-
-                const baseHeight = Math.floor(
-                    mountainBaseHeight * (heightFactor + cornerBoost)
-                );
-
-                let terrainVariationFactor;
-                if (
-                    isNearWest &&
-                    distFromWest <= distFromNorth &&
-                    distFromWest <= distFromSouth
-                ) {
-
-                    terrainVariationFactor = z / settings.length;
-                } else if (
-                    isNearEast &&
-                    distFromEast <= distFromNorth &&
-                    distFromEast <= distFromSouth
-                ) {
-
-                    terrainVariationFactor = z / settings.length;
-                } else if (
-                    isNearNorth &&
-                    distFromNorth <= distFromWest &&
-                    distFromNorth <= distFromEast
-                ) {
-
-                    terrainVariationFactor = x / settings.width;
-                } else {
-
-                    terrainVariationFactor = x / settings.width;
-                }
-
-
-                const ridgeFactor = Math.cos(x * 0.2) * Math.sin(z * 0.15) * 6;
-
-                const edgeVariation =
-                    Math.sin(terrainVariationFactor * Math.PI * 4) * 5;
-
-                const localMountainHeight = Math.floor(
-                    baseHeight + ridgeFactor + edgeVariation
-                );
-
-                const noise1 = Math.sin(x * 0.8) * Math.cos(z * 0.8) * 2;
-                const noise2 = Math.cos(x * 0.3 + z * 0.2) * 2;
-                const noiseOffset = noise1 + noise2;
-                const finalHeight = Math.max(
-                    1,
-                    Math.floor(localMountainHeight + noiseOffset)
-                );
-
-                const key = `${worldX},${worldZ}`;
-                const currentHeight = surfaceHeightMap[key] || 0;
-
-                if (finalHeight <= 0 || currentHeight >= finalHeight) continue;
-
-                for (let y = currentHeight + 1; y <= finalHeight; y++) {
-
-
-                    if (settings.mountainRange.snowCap) {
-
-                        if (y === finalHeight && y >= snowHeight - 5) {
-                            terrainData[`${worldX},${y},${worldZ}`] =
-                                blockTypes.snow;
-                        }
-
-                        else if (
-                            y >= snowHeight - 3 &&
-                            y >= finalHeight - 2 &&
-                            Math.random() < 0.7
-                        ) {
-                            terrainData[`${worldX},${y},${worldZ}`] =
-                                blockTypes.snow;
-                        }
-
-                        else if (y >= snowHeight - 8 && Math.random() < 0.3) {
-                            terrainData[`${worldX},${y},${worldZ}`] =
-                                blockTypes.snow;
-                        }
-
-                        else {
-                            terrainData[`${worldX},${y},${worldZ}`] =
-                                blockTypes.stone;
-                        }
-                    } else {
-                        terrainData[`${worldX},${y},${worldZ}`] =
-                            blockTypes.stone;
-                    }
-                    blocksCount++;
-                }
-
-                surfaceHeightMap[key] = finalHeight;
-            }
-        }
-    }
-
-    const treeOffsetX = Math.floor(Math.random() * 5);
-    const treeOffsetZ = Math.floor(Math.random() * 5);
-
-    updateProgress("Adding trees and vegetation...", 85);
-
-
-    const cactusOffsetX = Math.floor(Math.random() * 7);
-    const cactusOffsetZ = Math.floor(Math.random() * 7);
-    for (let z = 0; z < settings.length; z++) {
-        for (let x = 0; x < settings.width; x++) {
-            const worldX = startX + x;
-            const worldZ = startZ + z;
-            const biomeIndex = z * settings.width + x;
-            const biome = biomeMap[biomeIndex];
-
-            let surfaceHeight = 0;
-            for (let y = settings.maxHeight - 1; y >= 0; y--) {
-                if (
-                    terrainData[`${worldX},${y},${worldZ}`] &&
-                    terrainData[`${worldX},${y},${worldZ}`] !==
-                        blockTypes["water-still"]
-                ) {
-                    surfaceHeight = y;
-                    break;
-                }
-            }
-
-            const surfaceBlock =
-                terrainData[`${worldX},${surfaceHeight},${worldZ}`];
-            if (
-                biome === "desert" &&
-                surfaceHeight > 0 &&
-                (surfaceBlock === blockTypes.sand ||
-                    surfaceBlock === blockTypes["sand-light"])
-            ) {
-
-                if (
-                    (x + cactusOffsetX) % 7 === 0 &&
-                    (z + cactusOffsetZ) % 7 === 0
-                ) {
-
-                    const noiseValue = Math.random();
-                    const temp = tempMap[biomeIndex] + temperatureOffset;
-
-                    let cactusProbability = 0.2; // Base probability
-                    if (temp > 0.8) {
-                        cactusProbability = 0.35; // Higher chance in very hot areas
-                    } else if (temp > 0.7) {
-                        cactusProbability = 0.3; // Medium-high chance in hot areas
-                    } else if (temp > 0.6) {
-                        cactusProbability = 0.25; // Medium chance in warm areas
-                    }
-
-                    if (noiseValue < cactusProbability) {
-                        const cactusHeight = 3 + Math.floor(Math.random() * 2); // Cactus height
-
-                        let canPlaceCactus = true;
-                        for (let ty = 1; ty <= cactusHeight; ty++) {
-                            if (
-                                terrainData[
-                                    `${worldX},${surfaceHeight + ty},${worldZ}`
-                                ]
-                            ) {
-                                canPlaceCactus = false;
-                                break;
-                            }
-                        }
-                        if (canPlaceCactus) {
-
-                            for (let ty = 1; ty <= cactusHeight; ty++) {
-                                terrainData[
-                                    `${worldX},${surfaceHeight + ty},${worldZ}`
-                                ] = blockTypes.cactus;
-                                blocksCount++;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    for (let z = 0; z < settings.length; z++) {
-        for (let x = 0; x < settings.width; x++) {
-            const worldX = startX + x;
-            const worldZ = startZ + z;
-            const biomeIndex = z * settings.width + x;
-            const biome = biomeMap[biomeIndex];
-
-            let surfaceHeight = 0;
-            for (let y = settings.maxHeight - 1; y >= 0; y--) {
-                if (
-                    terrainData[`${worldX},${y},${worldZ}`] &&
-                    terrainData[`${worldX},${y},${worldZ}`] !==
-                        blockTypes["water-still"]
-                ) {
-                    surfaceHeight = y;
-                    break;
-                }
-            }
-
-            if (biome === "desert") continue;
-
-            if ((x + treeOffsetX) % 5 === 0 && (z + treeOffsetZ) % 5 === 0) {
-
-                const surfaceBlock =
-                    terrainData[`${worldX},${surfaceHeight},${worldZ}`];
-                if (
-                    surfaceBlock === blockTypes.sand ||
-                    surfaceBlock === blockTypes["sand-light"]
-                ) {
-                    continue;
-                }
-
-                let treeProbability = 0.1; // Default low probability
-                if (biome === "forest" || biome === "taiga") {
-                    treeProbability = 0.3; // Higher probability in forests
-                } else if (biome === "plains" || biome === "savanna") {
-                    treeProbability = 0.15; // Medium probability in plains
-                } else if (
-                    biome === "snowy_forest" ||
-                    biome === "snowy_taiga"
-                ) {
-                    treeProbability = 0.25; // Medium-high probability in snowy forests
-                }
-                if (Math.random() < treeProbability) {
-
-                    let treeHeight = 4 + Math.floor(Math.random() * 2); // Default height
-                    if (biome === "savanna") {
-                        treeHeight = 5 + Math.floor(Math.random() * 2); // Taller trees in savanna
-                    } else if (
-                        biome === "snowy_plains" ||
-                        biome === "snowy_forest" ||
-                        biome === "snowy_taiga"
-                    ) {
-                        treeHeight = 3 + Math.floor(Math.random() * 2); // Shorter trees in snowy biomes
-                    }
-
-                    let canPlaceTree = true;
-                    for (let ty = 1; ty <= treeHeight + 2; ty++) {
-                        if (
-                            terrainData[
-                                `${worldX},${surfaceHeight + ty},${worldZ}`
-                            ]
-                        ) {
-                            canPlaceTree = false;
-                            break;
-                        }
-                    }
-                    if (canPlaceTree) {
-
-                        const logType =
-                            biome === "snowy_plains" ||
-                            biome === "snowy_forest" ||
-                            biome === "snowy_taiga"
-                                ? blockTypes["poplar log"]
-                                : biome === "desert"
-                                  ? blockTypes.cactus
-                                  : blockTypes.log;
-                        for (let ty = 1; ty <= treeHeight; ty++) {
-                            terrainData[
-                                `${worldX},${surfaceHeight + ty},${worldZ}`
-                            ] = logType;
+    // Rivers: water finds its level — fill to seaLevel (flat surface)
+    for (let z = 0; z < length; z++) {
+        for (let x = 0; x < width; x++) {
+            const wX = startX + x, wZ = startZ + z;
+            const k = `${wX},${wZ}`;
+            if (waterMap[k]) continue;
+            const rv = riverNoise[z * width + x];
+            if (rv > 0.44 && rv < 0.56) {
+                const h = surfaceHeightMap[k];
+                if (h <= seaLevel) {
+                    const rd = Math.min(2, Math.max(1, Math.floor((seaLevel - h) * 0.15) + 1));
+                    const bed = Math.max(1, h - rd);
+                    if (bed < h) {
+                        for (let y = bed + 1; y <= h; y++) delete terrainData[`${wX},${y},${wZ}`];
+                        for (let y = bed + 1; y <= seaLevel; y++) {
+                            terrainData[`${wX},${y},${wZ}`] = blockTypes["water-still"];
                             blocksCount++;
                         }
-
-                        if (biome !== "desert") {
-
-
-                            let leafRadius = 2;
-                            if (biome === "savanna") {
-                                leafRadius = 3; // Wider canopy for savanna
-                            } else if (
-                                biome === "snowy_plains" ||
-                                biome === "snowy_forest" ||
-                                biome === "snowy_taiga"
-                            ) {
-                                leafRadius = 2; // Standard canopy for snowy trees
+                        terrainData[`${wX},${bed},${wZ}`] = blockTypes.sand;
+                        waterMap[k] = true;
+                        waterBedHeightMap[k] = bed;
+                        for (let dx = -1; dx <= 1; dx++)
+                            for (let dz = -1; dz <= 1; dz++) {
+                                if (!dx && !dz) continue;
+                                const nk = `${wX + dx},${wZ + dz}`;
+                                if (!waterMap[nk] && surfaceHeightMap[nk] > 0 && surfaceHeightMap[nk] <= seaLevel + 2)
+                                    terrainData[`${wX + dx},${surfaceHeightMap[nk]},${wZ + dz}`] = blockTypes.sand;
                             }
-                            for (
-                                let ly = treeHeight - 1;
-                                ly <= treeHeight + 1;
-                                ly++
-                            ) {
-                                const layerRadius =
-                                    ly === treeHeight
-                                        ? leafRadius
-                                        : leafRadius - 1;
-                                for (
-                                    let lx = -layerRadius;
-                                    lx <= layerRadius;
-                                    lx++
-                                ) {
-                                    for (
-                                        let lz = -layerRadius;
-                                        lz <= layerRadius;
-                                        lz++
-                                    ) {
+                    }
+                }
+            }
+        }
+    }
 
-                                        if (
-                                            lx === 0 &&
-                                            lz === 0 &&
-                                            ly < treeHeight
-                                        )
-                                            continue;
+    // -----------------------------------------------------------------------
+    // 6. Caves & Ores (Minecraft-style: carve caves first, then place ore veins)
+    // -----------------------------------------------------------------------
+    updateProgress("Carving caves...", 75);
+    const smallCaveNoise = generatePerlinNoise3D(width, maxHeight, length, {
+        octaveCount: 2, scale: 0.03, persistence: 0.5, amplitude: 1.0, seed: seedNum + 20,
+    });
+    const largeCaveNoise = generatePerlinNoise3D(width, maxHeight, length, {
+        octaveCount: 2, scale: 0.06, persistence: 0.5, amplitude: 1.0, seed: seedNum + 21,
+    });
 
-                                        const dist = Math.sqrt(
-                                            lx * lx +
-                                                lz * lz +
-                                                (ly - treeHeight) *
-                                                    (ly - treeHeight) *
-                                                    0.5
-                                        );
+    const caveFac = settings.caveDensityFactor ?? 1.0;
+    const caveThresh = hollowWorld ? 0.38 : (0.68 - (caveFac - 0.5) * 0.25);
+    const caveThreshL = hollowWorld ? 0.30 : Math.min(0.55, caveThresh - 0.05);
 
-                                        if (
-                                            dist <= layerRadius ||
-                                            (dist <= layerRadius + 0.5 &&
-                                                Math.random() < 0.5)
-                                        ) {
-                                            const leafKey = `${worldX + lx},${surfaceHeight + ly},${worldZ + lz}`;
-                                            if (!terrainData[leafKey]) {
+    // Hollow worlds: add mega-cave noise for large caverns
+    let megaCaveNoise = null;
+    if (hollowWorld) {
+        megaCaveNoise = generatePerlinNoise3D(width, maxHeight, length, {
+            octaveCount: 1, scale: 0.02, persistence: 0.5, amplitude: 1.0, seed: seedNum + 25,
+        });
+    }
 
-                                                const leafType =
-                                                    biome === "snowy_plains" ||
-                                                    biome === "snowy_forest" ||
-                                                    biome === "snowy_taiga"
-                                                        ? blockTypes[
-                                                              "cold-leaves"
-                                                          ]
-                                                        : blockTypes[
-                                                              "oak-leaves"
-                                                          ];
-                                                terrainData[leafKey] = leafType;
+    const stoneIds = new Set([
+        blockTypes.stone, blockTypes.deepslate, blockTypes.andesite, blockTypes.granite,
+        blockTypes.diorite, blockTypes.cobblestone, blockTypes["cobbled-deepslate"],
+        blockTypes["smooth-stone"], blockTypes["mossy-cobblestone"],
+        blockTypes["mossy-stone-bricks"], blockTypes["stone-bricks"],
+    ].filter(Boolean));
+
+    function isStone(block) {
+        return block && stoneIds.has(block);
+    }
+
+    for (let z = 0; z < length; z++) {
+        for (let x = 0; x < width; x++) {
+            const wX = startX + x, wZ = startZ + z;
+            const sh = surfaceHeightMap[`${wX},${wZ}`] || 0;
+
+            for (let y = Math.min(sh - 2, maxHeight - 3); y > (hollowWorld ? -1 : 1); y--) {
+                const bk = `${wX},${y},${wZ}`;
+                const block = terrainData[bk];
+                if (!block) continue;
+                if (!hollowWorld && !isStone(block)) continue;
+
+                const ni = z * width * maxHeight + y * width + x;
+                const sv = smallCaveNoise[ni];
+                const lv = largeCaveNoise[ni];
+                let carve = (sv > caveThreshL && lv > caveThresh - 0.15) || sv > caveThresh || lv > caveThresh - 0.02;
+                if (hollowWorld && megaCaveNoise && (megaCaveNoise[ni] > 0.35 || carve)) {
+                    carve = true;
+                }
+                if (carve) {
+                    delete terrainData[bk];
+                }
+            }
+        }
+
+        if (z % Math.ceil(length / 10) === 0) {
+            updateProgress(`Carving caves: ${Math.floor((z / length) * 100)}%`, 75 + (z / length) * 2);
+        }
+    }
+
+    // Minecraft-style ore veins: skip for hollow (no rock)
+    if (settings.generateOres !== false && !hollowWorld) {
+        updateProgress("Placing ore veins...", 78);
+        const DEEPSLATE_ZONE = 16;
+        const CHUNK_SIZE = 16;
+        const rarity = settings.oreRarity ?? 0.78; // 0.58=common, 0.78=rare
+        const oreMult = Math.max(0.5, 0.6 + (0.78 - rarity)); // more ores when rarity is lower
+
+        const ORE_MULTIPLIER = 3;
+        const oreConfigs = [
+            { name: "coal", normal: "coal", deep: "deepslate-coal", attempts: Math.max(30, Math.floor(24 * oreMult * ORE_MULTIPLIER)), veinSize: 17, yMin: 4, yMax: 50 },
+            { name: "iron", normal: "iron", deep: "deepslate-iron", attempts: Math.max(24, Math.floor(20 * oreMult * ORE_MULTIPLIER)), veinSize: 9, yMin: 4, yMax: 54 },
+            { name: "gold", normal: "gold", deep: "deepslate-gold", attempts: Math.max(6, Math.floor(6 * oreMult * ORE_MULTIPLIER)), veinSize: 8, yMin: 4, yMax: 32 },
+            { name: "diamond", normal: "diamond", deep: "deepslate-diamond", attempts: Math.max(6, Math.floor(5 * oreMult * ORE_MULTIPLIER)), veinSize: 6, yMin: 2, yMax: 18 },
+            { name: "emerald", normal: "emerald", deep: "deepslate-emerald", attempts: Math.max(3, Math.floor(3 * oreMult * ORE_MULTIPLIER)), veinSize: 4, yMin: 12, yMax: 30 },
+            { name: "ruby", normal: "ruby", deep: "deepslate-ruby", attempts: Math.max(3, Math.floor(3 * oreMult * ORE_MULTIPLIER)), veinSize: 5, yMin: 2, yMax: 16 },
+            { name: "sapphire", normal: "sapphire", deep: "deepslate-sapphire", attempts: Math.max(3, Math.floor(3 * oreMult * ORE_MULTIPLIER)), veinSize: 5, yMin: 2, yMax: 18 },
+        ];
+
+        const chunkMinX = Math.floor(startX / CHUNK_SIZE);
+        const chunkMaxX = Math.ceil((startX + width) / CHUNK_SIZE);
+        const chunkMinZ = Math.floor(startZ / CHUNK_SIZE);
+        const chunkMaxZ = Math.ceil((startZ + length) / CHUNK_SIZE);
+        let veinAttempts = 0;
+
+        function makeVeinRng(attemptId) {
+            let s = (seedNum ^ (attemptId * 0x9e3779b9)) >>> 0;
+            return function () {
+                s = (s * 1103515245 + 12345) >>> 0;
+                return s / 4294967296;
+            };
+        }
+
+        for (const cfg of oreConfigs) {
+            const oreIdNormal = blockTypes[cfg.normal];
+            const oreIdDeep = blockTypes[cfg.deep] || oreIdNormal;
+            if (!oreIdNormal) continue;
+
+            for (let cz = chunkMinZ; cz < chunkMaxZ; cz++) {
+                for (let cx = chunkMinX; cx < chunkMaxX; cx++) {
+                    for (let a = 0; a < cfg.attempts; a++) {
+                        veinAttempts++;
+                        const attemptId = veinAttempts * 7919 + cx * 17 + cz * 13 + cfg.name.charCodeAt(0);
+                        const prng = makeVeinRng(attemptId);
+
+                        const baseX = cx * CHUNK_SIZE;
+                        const baseZ = cz * CHUNK_SIZE;
+                        const rx = Math.floor(prng() * CHUNK_SIZE);
+                        const rz = Math.floor(prng() * CHUNK_SIZE);
+                        const wX = baseX + rx;
+                        const wZ = baseZ + rz;
+                        const wY = cfg.yMin + Math.floor(prng() * (cfg.yMax - cfg.yMin + 1));
+
+                        if (wX < startX || wX >= startX + width || wZ < startZ || wZ >= startZ + length) continue;
+                        if (wY < 2 || wY >= maxHeight - 1) continue;
+
+                        const centerKey = `${wX},${wY},${wZ}`;
+                        const centerBlock = terrainData[centerKey];
+                        if (!isStone(centerBlock)) continue;
+
+                        const deep = wY <= DEEPSLATE_ZONE;
+                        const oreId = deep ? oreIdDeep : oreIdNormal;
+
+                        // Place vein: random-walk blob from center (Minecraft/Hytale style)
+                        const placed = new Set([centerKey]);
+                        terrainData[centerKey] = oreId;
+                        let x = wX, y = wY, z = wZ;
+
+                        for (let i = 0; i < cfg.veinSize - 1; i++) {
+                            const dir = Math.floor(prng() * 6);
+                            const dx = dir === 0 ? 1 : dir === 1 ? -1 : 0;
+                            const dy = dir === 2 ? 1 : dir === 3 ? -1 : 0;
+                            const dz = dir === 4 ? 1 : dir === 5 ? -1 : 0;
+                            x += dx;
+                            y += dy;
+                            z += dz;
+
+                            if (y < 2 || y >= maxHeight - 1) { x -= dx; y -= dy; z -= dz; continue; }
+                            if (x < startX || x >= startX + width || z < startZ || z >= startZ + length) { x -= dx; y -= dy; z -= dz; continue; }
+
+                            const key = `${x},${y},${z}`;
+                            if (placed.has(key)) continue;
+                            const b = terrainData[key];
+                            if (!isStone(b)) continue;
+
+                            placed.add(key);
+                            terrainData[key] = oreId;
+                        }
+                    }
+                }
+            }
+        }
+
+        updateProgress("Ore veins placed", 80);
+    }
+
+    // Underground lava pools (skip for hollow)
+    const lavaId = blockTypes.lava;
+    if (lavaId && !hollowWorld) {
+        const CHUNK = 16;
+        const lavaAttempts = Math.max(2, Math.floor((width * length) / (CHUNK * CHUNK * 4)));
+        let la = 0;
+        for (let a = 0; a < lavaAttempts; a++) {
+            la++;
+            const prng = (() => {
+                let s = (seedNum ^ (la * 0x9e3779b9)) >>> 0;
+                return () => { s = (s * 1103515245 + 12345) >>> 0; return s / 4294967296; };
+            })();
+            const wX = startX + Math.floor(prng() * width);
+            const wZ = startZ + Math.floor(prng() * length);
+            const wY = 4 + Math.floor(prng() * 11);
+            const centerKey = `${wX},${wY},${wZ}`;
+            if (!isStone(terrainData[centerKey])) continue;
+            terrainData[centerKey] = lavaId;
+            for (let i = 0; i < 8; i++) {
+                const dx = Math.floor(prng() * 3) - 1;
+                const dy = Math.floor(prng() * 3) - 1;
+                const dz = Math.floor(prng() * 3) - 1;
+                const nx = wX + dx, ny = wY + dy, nz = wZ + dz;
+                if (ny < 2 || ny >= maxHeight - 1) continue;
+                const key = `${nx},${ny},${nz}`;
+                if (isStone(terrainData[key])) terrainData[key] = lavaId;
+            }
+        }
+    }
+
+    // Underwater cleanup
+    updateProgress("Smoothing underwater terrain...", 82);
+    for (let z = 0; z < length; z++) {
+        for (let x = 0; x < width; x++) {
+            const wX = startX + x, wZ = startZ + z;
+            const k = `${wX},${wZ}`;
+            if (!waterMap[k] || !waterBedHeightMap[k]) continue;
+            const bed = waterBedHeightMap[k];
+            for (let y = bed - 1; y > 0; y--) {
+                const bk = `${wX},${y},${wZ}`;
+                if (!terrainData[bk]) continue;
+                let adjB = 0, adjW = 0;
+                for (let dz = -1; dz <= 1; dz++)
+                    for (let dx = -1; dx <= 1; dx++) {
+                        if (!dx && !dz) continue;
+                        if (terrainData[`${wX + dx},${y},${wZ + dz}`]) adjB++;
+                        if (waterMap[`${wX + dx},${wZ + dz}`]) adjW++;
+                    }
+                const hf = (y - 1) / bed;
+                if (adjB <= Math.floor(2 + 3 * hf) && adjW >= 4) delete terrainData[bk];
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 7. Snow Caps on High Terrain
+    // -----------------------------------------------------------------------
+    updateProgress("Adding snow caps...", 84);
+    const snowCapHeight = seaLevel + 20;
+    for (let z = 0; z < length; z++) {
+        for (let x = 0; x < width; x++) {
+            const wX = startX + x, wZ = startZ + z;
+            const sh = surfaceHeightMap[`${wX},${wZ}`] || 0;
+            if (sh >= snowCapHeight) {
+                for (let y = maxHeight - 1; y >= snowCapHeight; y--) {
+                    const bk = `${wX},${y},${wZ}`;
+                    if (terrainData[bk] && terrainData[bk] !== blockTypes["water-still"]) {
+                        terrainData[bk] = blockTypes.snow;
+                        for (let dy = 1; dy <= 2; dy++) {
+                            const bk2 = `${wX},${y - dy},${wZ}`;
+                            if (terrainData[bk2] === blockTypes.dirt ||
+                                terrainData[bk2] === blockTypes["grass-block"] ||
+                                terrainData[bk2] === blockTypes.grass)
+                                terrainData[bk2] = blockTypes.stone;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 8. Mountain Ranges (border mountains) - skip on small worlds to avoid huge borders
+    // -----------------------------------------------------------------------
+    const minDim = Math.min(width, length);
+    const skipBorderMountains = minDim < 120;
+    if (settings.mountainRange && settings.mountainRange.enabled && !skipBorderMountains) {
+        updateProgress("Creating mountain ranges...", 86);
+        const sizeFactor = Math.max(0.05, 1.0 - settings.mountainRange.size * 4.0);
+        const mBaseH = settings.mountainRange.height * 2 * (1 + sizeFactor * 0.5);
+        const snowH = settings.mountainRange.snowHeight * 1.5;
+        const mWidth = Math.max(3, Math.min(Math.floor(width * 0.25 * sizeFactor), Math.floor(minDim * 0.08)));
+
+        for (let z = 0; z < length; z++) {
+            for (let x = 0; x < width; x++) {
+                const wX = startX + x, wZ = startZ + z;
+                const dE = Math.min(x, width - x - 1, z, length - z - 1);
+                if (dE > mWidth) continue;
+
+                let hf = Math.cos((dE / mWidth) * Math.PI * 0.5);
+                // Corner boost
+                const dW = x, dEr = width - x - 1, dN = z, dS = length - z - 1;
+                const nW = dW <= mWidth, nE = dEr <= mWidth, nN = dN <= mWidth, nS = dS <= mWidth;
+                let cb = 0;
+                if ((nW && nN) || (nW && nS) || (nE && nN) || (nE && nS)) {
+                    let d1, d2;
+                    if (nW && nN) { d1 = dW; d2 = dN; }
+                    else if (nW && nS) { d1 = dW; d2 = dS; }
+                    else if (nE && nN) { d1 = dEr; d2 = dN; }
+                    else { d1 = dEr; d2 = dS; }
+                    cb = (1 - d1 / mWidth) * (1 - d2 / mWidth) * 0.4;
+                }
+
+                const bH = Math.floor(mBaseH * (hf + cb));
+                const ridge = Math.cos(x * 0.2) * Math.sin(z * 0.15) * 6;
+                const vf = (nW || nE) ? z / length : x / width;
+                const edgeVar = Math.sin(vf * Math.PI * 4) * 5;
+                const n1 = Math.sin(x * 0.8) * Math.cos(z * 0.8) * 2;
+                const n2 = Math.cos(x * 0.3 + z * 0.2) * 2;
+                const fH = Math.max(1, Math.floor(bH + ridge + edgeVar + n1 + n2));
+
+                const k = `${wX},${wZ}`;
+                const curH = surfaceHeightMap[k] || 0;
+                if (fH <= 0 || curH >= fH) continue;
+
+                for (let y = curH + 1; y <= fH; y++) {
+                    if (settings.mountainRange.snowCap && y >= snowH - 5 && y === fH) {
+                        terrainData[`${wX},${y},${wZ}`] = blockTypes.snow;
+                    } else if (settings.mountainRange.snowCap && y >= snowH - 3 && y >= fH - 2 && rng() < 0.7) {
+                        terrainData[`${wX},${y},${wZ}`] = getStoneBlock(blockTypes, y, rng);
+                    } else if (settings.mountainRange.snowCap && y >= snowH - 8 && rng() < 0.3) {
+                        terrainData[`${wX},${y},${wZ}`] = blockTypes.stone;
+                    } else {
+                        const name = MOUNTAIN_STONE[Math.floor(rng() * MOUNTAIN_STONE.length)];
+                        terrainData[`${wX},${y},${wZ}`] = resolveBlock(blockTypes, name) || blockTypes.stone;
+                    }
+                    blocksCount++;
+                }
+                surfaceHeightMap[k] = fH;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 9. Trees & Vegetation
+    // -----------------------------------------------------------------------
+    updateProgress("Adding trees and vegetation...", 90);
+
+    const treeOffX = Math.floor(rng() * 5);
+    const treeOffZ = Math.floor(rng() * 5);
+
+    for (let z = 0; z < length; z++) {
+        for (let x = 0; x < width; x++) {
+            const wX = startX + x, wZ = startZ + z;
+            const biome = biomeMap[z * width + x];
+
+            if (biome === "desert" || biome === "ocean") continue;
+
+            // Find current surface (post-water)
+            let sh = 0;
+            for (let y = maxHeight - 1; y >= 0; y--) {
+                const bk = `${wX},${y},${wZ}`;
+                if (terrainData[bk] && terrainData[bk] !== blockTypes["water-still"]) { sh = y; break; }
+            }
+            if (sh <= seaLevel || sh <= 0) continue;
+
+            const surfBlock = terrainData[`${wX},${sh},${wZ}`];
+            if (surfBlock === blockTypes.sand || surfBlock === blockTypes["sand-wet"] || surfBlock === blockTypes.sandstone) continue;
+
+            const tc = getTreeConfig(biome, blockTypes, rng);
+
+            // Grid-based placement with seeded offsets
+            const gridSize = biome === "jungle" ? 4 : biome === "savanna" ? 7 : 5;
+            if ((x + treeOffX) % gridSize !== 0 || (z + treeOffZ) % gridSize !== 0) continue;
+            if (rng() >= tc.prob) continue;
+
+            // Space check
+            let canPlace = true;
+            for (let ty = 1; ty <= tc.height + 2; ty++) {
+                if (terrainData[`${wX},${sh + ty},${wZ}`]) { canPlace = false; break; }
+            }
+            if (!canPlace) continue;
+
+            // Trunk
+            for (let ty = 1; ty <= tc.height; ty++) {
+                terrainData[`${wX},${sh + ty},${wZ}`] = tc.log;
+                blocksCount++;
+            }
+
+            // Canopy
+            for (let ly = tc.height - 1; ly <= tc.height + 1; ly++) {
+                const lr = ly === tc.height ? tc.radius : tc.radius - 1;
+                for (let lx = -lr; lx <= lr; lx++) {
+                    for (let lz = -lr; lz <= lr; lz++) {
+                        if (lx === 0 && lz === 0 && ly < tc.height) continue;
+                        const dist = Math.sqrt(lx * lx + lz * lz + (ly - tc.height) * (ly - tc.height) * 0.5);
+                        if (dist <= lr || (dist <= lr + 0.5 && rng() < 0.5)) {
+                            const lk = `${wX + lx},${sh + ly},${wZ + lz}`;
+                            if (!terrainData[lk]) {
+                                terrainData[lk] = tc.leaf;
+                                blocksCount++;
+                    }
+                }
+            }
+        }
+    }
+
+            // Random extra leaves
+            for (let i = 0; i < 4; i++) {
+                const lx = Math.floor(rng() * 5) - 2;
+                const ly = tc.height + Math.floor(rng() * 3) - 1;
+                const lz = Math.floor(rng() * 5) - 2;
+                if (Math.abs(lx) <= tc.radius && Math.abs(lz) <= tc.radius &&
+                    ly >= tc.height - 1 && ly <= tc.height + 1) {
+                    const lk = `${wX + lx},${sh + ly},${wZ + lz}`;
+                    if (!terrainData[lk]) { terrainData[lk] = tc.leaf; blocksCount++; }
+                }
+            }
+        }
+    }
+
+    // Desert features: sandstone structures
+    for (let z = 0; z < length; z++) {
+        for (let x = 0; x < width; x++) {
+            const wX = startX + x, wZ = startZ + z;
+            const biome = biomeMap[z * width + x];
+            if (biome !== "desert") continue;
+
+            let sh = 0;
+            for (let y = maxHeight - 1; y >= 0; y--) {
+                if (terrainData[`${wX},${y},${wZ}`]) { sh = y; break; }
+            }
+            if (sh <= 0) continue;
+
+            if (rng() < 0.04) {
+                terrainData[`${wX},${sh + 1},${wZ}`] = blockTypes.sandstone;
+                            blocksCount++;
+                if (rng() < 0.3) {
+                    for (let dx = -1; dx <= 1; dx++)
+                        for (let dz = -1; dz <= 1; dz++)
+                            if ((dx === 0 || dz === 0) && !(dx === 0 && dz === 0)) {
+                                terrainData[`${wX + dx},${sh + 1},${wZ + dz}`] = blockTypes.sandstone;
                                                 blocksCount++;
                                             }
                                         }
@@ -1332,152 +1012,339 @@ export function generateHytopiaWorld(
                                 }
                             }
 
-                            for (let i = 0; i < 5; i++) {
-                                const lx = Math.floor(Math.random() * 5) - 2;
-                                const ly =
-                                    treeHeight +
-                                    Math.floor(Math.random() * 3) -
-                                    1;
-                                const lz = Math.floor(Math.random() * 5) - 2;
-                                if (
-                                    Math.abs(lx) <= leafRadius &&
-                                    Math.abs(lz) <= leafRadius &&
-                                    ly >= treeHeight - 1 &&
-                                    ly <= treeHeight + 1
-                                ) {
-                                    const leafKey = `${worldX + lx},${surfaceHeight + ly},${worldZ + lz}`;
-                                    if (!terrainData[leafKey]) {
+    // Build sets of leaf and log block IDs so we don't place clutter on/in trees
+    const leafIds = new Set();
+    const logIds = new Set();
+    for (const t of Object.values(TREE_BY_BIOME)) {
+        if (blockTypes[t.leaf]) leafIds.add(blockTypes[t.leaf]);
+        if (blockTypes[t.log]) logIds.add(blockTypes[t.log]);
+    }
+    for (const k of Object.keys(blockTypes)) {
+        if (k.includes("leaves") && blockTypes[k]) leafIds.add(blockTypes[k]);
+        if ((k.includes("-log") || k === "mushroom-stem") && blockTypes[k]) logIds.add(blockTypes[k]);
+    }
 
-                                        const leafType =
-                                            biome === "snowy_plains" ||
-                                            biome === "snowy_forest" ||
-                                            biome === "snowy_taiga"
-                                                ? blockTypes["cold-leaves"]
-                                                : blockTypes["oak-leaves"];
-                                        terrainData[leafKey] = leafType;
-                                        blocksCount++;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+    // Surface clutter: rocks, flowers, fallen logs (all non-desert/ocean land)
+    for (let z = 0; z < length; z++) {
+        for (let x = 0; x < width; x++) {
+            const wX = startX + x, wZ = startZ + z;
+            const biome = biomeMap[z * width + x];
+            if (biome === "desert" || biome === "ocean") continue;
+            if (rng() >= 0.08) continue;
+
+            let sh = 0;
+            for (let y = maxHeight - 1; y >= 0; y--) {
+                const bk = `${wX},${y},${wZ}`;
+                if (terrainData[bk] && terrainData[bk] !== blockTypes["water-still"]) { sh = y; break; }
             }
+            if (sh <= seaLevel || sh <= 0) continue;
+            const surf = terrainData[`${wX},${sh},${wZ}`];
+            if (!surf || surf === blockTypes.sand || surf === blockTypes["sand-wet"] || surf === blockTypes.snow) continue;
+            if (leafIds.has(surf) || logIds.has(surf)) continue;
+            if (terrainData[`${wX},${sh + 1},${wZ}`]) continue;
 
-            if (
-                biome === "desert" &&
-                Math.random() < 0.05 &&
-                surfaceHeight > 0
-            ) {
-
-                terrainData[`${worldX},${surfaceHeight + 1},${worldZ}`] =
-                    blockTypes.sandstone;
-                blocksCount++;
-                if (Math.random() < 0.3) {
-                    for (let dx = -1; dx <= 1; dx++) {
-                        for (let dz = -1; dz <= 1; dz++) {
-                            if (
-                                (dx === 0 || dz === 0) &&
-                                !(dx === 0 && dz === 0)
-                            ) {
-                                terrainData[
-                                    `${worldX + dx},${surfaceHeight + 1},${worldZ + dz}`
-                                ] = blockTypes.sandstone;
-                                blocksCount++;
-                            }
-                        }
-                    }
+            const roll = rng();
+            if (roll < 0.35) {
+                terrainData[`${wX},${sh + 1},${wZ}`] = blockTypes.cobblestone || blockTypes.stone;
+            } else if (roll < 0.65) {
+                terrainData[`${wX},${sh + 1},${wZ}`] = blockTypes["grass-flower"] || blockTypes["grass-flower-block"] || blockTypes.grass;
+            } else if (roll < 0.85) {
+                terrainData[`${wX},${sh + 1},${wZ}`] = blockTypes.grass;
+            } else {
+                const logId = blockTypes["oak-log"] || blockTypes["birch-log"];
+                if (logId && rng() < 0.5) {
+                    terrainData[`${wX},${sh + 1},${wZ}`] = logId;
+                    if (rng() < 0.5 && !terrainData[`${wX + 1},${sh + 1},${wZ}`]) terrainData[`${wX + 1},${sh + 1},${wZ}`] = logId;
                 }
             }
         }
     }
-    updateProgress(
-        `World generation complete. Created ${blocksCount} blocks.`,
-        100
-    );
 
-    return terrainData;
+    // Swamp features: mushrooms
+    for (let z = 0; z < length; z++) {
+        for (let x = 0; x < width; x++) {
+            const wX = startX + x, wZ = startZ + z;
+            const biome = biomeMap[z * width + x];
+            if (biome !== "swamp") continue;
+            if (rng() >= 0.02) continue;
+
+            let sh = 0;
+            for (let y = maxHeight - 1; y >= 0; y--) {
+                const bk = `${wX},${y},${wZ}`;
+                if (terrainData[bk] && terrainData[bk] !== blockTypes["water-still"]) { sh = y; break; }
+            }
+            if (sh <= seaLevel) continue;
+            const swampSurf = terrainData[`${wX},${sh},${wZ}`];
+            if (leafIds.has(swampSurf) || logIds.has(swampSurf)) continue;
+
+            // Small mushroom
+            const mh = 3 + Math.floor(rng() * 2);
+            let canPlace = true;
+            for (let ty = 1; ty <= mh + 1; ty++)
+                if (terrainData[`${wX},${sh + ty},${wZ}`]) { canPlace = false; break; }
+            if (!canPlace) continue;
+
+            for (let ty = 1; ty <= mh; ty++) {
+                terrainData[`${wX},${sh + ty},${wZ}`] = blockTypes["mushroom-stem"] || blockTypes["oak-log"] || blockTypes.stone;
+                blocksCount++;
+            }
+            const cap = rng() < 0.5 ? blockTypes["brown-mushroom-block"] : blockTypes["red-mushroom-block"];
+            for (let dx = -1; dx <= 1; dx++)
+                        for (let dz = -1; dz <= 1; dz++) {
+                    const lk = `${wX + dx},${sh + mh + 1},${wZ + dz}`;
+                    if (!terrainData[lk]) { terrainData[lk] = cap || blockTypes["oak-leaves"]; blocksCount++; }
+                }
+        }
+    }
+
+    // Frozen lakes in snowy biomes
+    for (let z = 0; z < length; z++) {
+        for (let x = 0; x < width; x++) {
+            const wX = startX + x, wZ = startZ + z;
+            const biome = biomeMap[z * width + x];
+            if (!biome.startsWith("snowy_")) continue;
+            const k = `${wX},${wZ}`;
+            if (!waterMap[k]) continue;
+            const iceKey = `${wX},${seaLevel},${wZ}`;
+            if (terrainData[iceKey] === blockTypes["water-still"]) {
+                terrainData[iceKey] = blockTypes.ice || blockTypes.snow;
+            }
+        }
+    }
+
+    // Deepslate crust passover: map deepslate to the underside of the terrain (2 blocks thick to seal gaps)
+    updateProgress("Adding deepslate crust...", 98);
+    const deepslateId = blockTypes.deepslate || blockTypes["cobbled-deepslate"] || blockTypes.stone;
+    const colMinY = new Map(); // "x,z" -> lowest Y in that column
+    for (const [, r] of blockStore.regions) {
+        for (const [posKey] of iteratePackedRegion(r.packed, r.rx, r.ry, r.rz)) {
+            const [px, py, pz] = posKey.split(",").map(Number);
+            const k = `${px},${pz}`;
+            const cur = colMinY.get(k);
+            if (cur === undefined || py < cur) colMinY.set(k, py);
+        }
+    }
+    for (const [k, minY] of colMinY) {
+        const [px, pz] = k.split(",").map(Number);
+        terrainData[`${px},${minY},${pz}`] = deepslateId;
+        if (minY > 0) terrainData[`${px},${minY - 1},${pz}`] = deepslateId;
+    }
+
+    updateProgress(`World generation complete. Created ${blocksCount} blocks.`, 100);
+    return { blockStore, terrainData };
 }
-/**
- * Generates a 3D density field for terrain
- * @param {number} width - World width
- * @param {number} height - World height
- * @param {number} length - World length
- * @param {Object} settings - Generation settings
- * @param {number} seedNum - Seed number
- * @param {Array} biomeMap - Biome assignment for each x,z coordinate
- * @param {Float32Array} finalHeightMap - Final height map for terrain generation
- * @param {boolean} isCompletelyFlat - Flag indicating if the terrain is completely flat
- * @returns {Float32Array} 3D density field where positive values = solid, negative = air
- */
-function generate3DDensityField(
-    width,
-    height,
-    length,
-    settings,
-    seedNum,
-    biomeMap,
-    finalHeightMap,
-    isCompletelyFlat
-) {
+
+// ---------------------------------------------------------------------------
+// 3D Density Field
+// ---------------------------------------------------------------------------
+function generate3DDensityField(width, height, length, settings, seedNum, biomeMap, finalHeightMap, isFlat) {
+    const densityField = new Float32Array(width * height * length);
+    const seaLevel = settings.seaLevel ?? Math.floor(height * 0.55);
+    const baseY = Math.max(4, seaLevel - 20);
+    const heightRange = Math.min(height - 12, 48) * (settings.roughness || 1.0);
 
     const continentalnessNoise = generatePerlinNoise3D(width, height, length, {
-        octaveCount: 2,
-        scale: settings.scale * 0.5,
-        persistence: 0.7,
-        amplitude: 1.0,
-        seed: seedNum,
+        octaveCount: 2, scale: (settings.scale || 0.05) * 0.5,
+        persistence: 0.7, amplitude: 1.0, seed: seedNum,
     });
-    const densityField = new Float32Array(width * height * length);
-    const REFERENCE_HEIGHT = 32;
-    console.log(
-        `Using fixed reference height ${REFERENCE_HEIGHT} for terrain shaping, actual sea level: ${settings.seaLevel}`
-    );
+
     for (let z = 0; z < length; z++) {
         for (let y = 0; y < height; y++) {
             for (let x = 0; x < width; x++) {
-                const index = z * width * height + y * width + x;
-                const biomeIndex = z * width + x;
-                const biome = biomeMap[biomeIndex];
-                if (isCompletelyFlat) {
-                    const flatSurfaceHeight = Math.round(
-                        16 + finalHeightMap[biomeIndex] * 32
-                    );
-                    densityField[index] = y < flatSurfaceHeight ? 10.0 : -10.0;
+                const idx = z * width * height + y * width + x;
+                const bIdx = z * width + x;
+                const biome = biomeMap[bIdx];
+                const rawH = finalHeightMap[bIdx];
+
+                if (isFlat) {
+                    const flatH = Math.round(16 + rawH * 32);
+                    densityField[idx] = y < flatH ? 10.0 : -10.0;
                 } else {
-
-                    let density = REFERENCE_HEIGHT - y;
-
-                    if (biome === "desert") {
-                        density *= 0.95; // Reduced from 0.9
-                    } else if (biome === "forest") {
-                        density *= 1.05; // Reduced from 1.1
-                    }
-
-                    let noiseAmplitude;
-                    if (settings.roughness < 0.5) {
-                        noiseAmplitude = 4.0 + (settings.roughness - 0.3) * 4.0; // Reduced from 6.0-14.0
-                    } else if (settings.roughness > 1.5) {
-                        noiseAmplitude = 6.0 + (settings.roughness - 1.5) * 2.0; // Reduced from 10.0-14.0
-                    } else {
-                        noiseAmplitude = 6.0; // Reduced from 10.0
-                    }
-
-                    density +=
-                        continentalnessNoise[index] *
-                        noiseAmplitude *
-                        (1.0 - settings.flatnessFactor);
-
-                    if (y <= 1) {
-                        density = 10.0;
-                    }
-                    densityField[index] = density;
+                    const targetSurface = baseY + rawH * heightRange;
+                    let density = targetSurface - y;
+                    if (biome === "desert") density += 0.5;
+                    else if (biome === "forest" || biome === "jungle") density -= 0.5;
+                    density += continentalnessNoise[idx] * 2.5 * (1.0 - (settings.flatnessFactor || 0));
+                    if (y <= 1) density = 10.0;
+                    densityField[idx] = density;
                 }
             }
         }
     }
     return densityField;
 }
-export default {
-    generateHytopiaWorld,
-};
+
+/**
+ * Compute preview data for seed map preview. Uses same heightmap + biome logic as full generator.
+ * Returns block Y and biome per (x,z) for 1:1 topography preview.
+ * @returns {{ blockY: Int32Array, biomeMap: string[], seaLevel: number, width: number, length: number }}
+ */
+export function computePreviewData(settings, seedNum) {
+    const width = settings.width;
+    const length = settings.length;
+    const maxHeight = settings.maxHeight ?? 64;
+    const seaLevel = settings.seaLevel ?? Math.floor(maxHeight * 0.55);
+    const scale = settings.scale || 0.04;
+
+    const continentalNoise = generatePerlinNoise(width, length, {
+        octaveCount: 2, scale: scale * 0.4, persistence: 0.6, amplitude: 1.0, seed: seedNum,
+    });
+    const hillNoise = generatePerlinNoise(width, length, {
+        octaveCount: 4, scale: scale * 1.5, persistence: 0.5, amplitude: 0.6, seed: seedNum + 1,
+    });
+    const detailNoise = generatePerlinNoise(width, length, {
+        octaveCount: 6, scale: scale * 4, persistence: 0.45, amplitude: 0.25, seed: seedNum + 2,
+    });
+    const depthMap = generatePerlinNoise(width, length, {
+        octaveCount: 2, scale: 0.018, persistence: 0.5, amplitude: 0.25, seed: seedNum + 6,
+    });
+    const riverValleyNoise = generatePerlinNoise(width, length, {
+        octaveCount: 2, scale: (settings.riverFreq || 0.05) * 0.8, persistence: 0.5, amplitude: 1.0, seed: seedNum + 5,
+    });
+
+    const heightMap = new Float32Array(width * length);
+    const flatFactor = settings.flatnessFactor || 0;
+    const elevExp = settings.elevationExponent ?? 1.5;
+    const amp = (settings.baseAmplitude ?? 1.0) * 0.5;
+    const landBias = settings.landBias ?? 0.15;
+
+    if (settings.isCompletelyFlat) {
+        for (let i = 0; i < heightMap.length; i++) heightMap[i] = 0.25;
+    } else {
+        for (let i = 0; i < heightMap.length; i++) {
+            const base = continentalNoise[i];
+            const hill = hillNoise[i] * (1.0 - flatFactor);
+            const detail = detailNoise[i] * (1.0 - flatFactor) * 0.5;
+            const depth = depthMap[i] * (1.0 - flatFactor) * 0.2;
+            const riverValley = Math.max(0, riverValleyNoise[i] - 0.45) * 2.5;
+            const raw = (base + hill + detail) * (1.0 + depth) * amp;
+            const carved = Math.max(0, raw - riverValley * 0.35);
+            const normalized = Math.max(0, Math.min(1, carved));
+            const lifted = Math.min(1, normalized + landBias);
+            heightMap[i] = Math.pow(lifted, elevExp) * (1.0 - flatFactor) + 0.4 * flatFactor;
+        }
+    }
+
+    const smoothedHeightMap = new Float32Array(width * length);
+    const sRadius = Math.floor(2 + (settings.terrainBlend || 0.5) * 2);
+    const smoothing = settings.smoothing || 0.7;
+    for (let z = 0; z < length; z++) {
+        for (let x = 0; x < width; x++) {
+            let total = 0, count = 0;
+            for (let dz = -sRadius; dz <= sRadius; dz++) {
+                for (let dx = -sRadius; dx <= sRadius; dx++) {
+                    const nx = x + dx, nz = z + dz;
+                    if (nx >= 0 && nx < width && nz >= 0 && nz < length) {
+                        const d = Math.sqrt(dx * dx + dz * dz);
+                        const w = 1 / (1 + d);
+                        total += heightMap[nz * width + nx] * w;
+                        count += w;
+                    }
+                }
+            }
+            smoothedHeightMap[z * width + x] =
+                (total / count) * smoothing + heightMap[z * width + x] * (1 - smoothing);
+        }
+    }
+
+    const roughness = settings.roughness || 1.0;
+    const baseY = Math.max(4, seaLevel - 20);
+    const heightRange = Math.min(maxHeight - 12, 48) * roughness;
+    const erodedHeightMap = new Float32Array(width * length);
+    for (let z = 0; z < length; z++) {
+        for (let x = 0; x < width; x++) {
+            const idx = z * width + x;
+            if (settings.isCompletelyFlat) { erodedHeightMap[idx] = heightMap[idx]; continue; }
+            let h = Math.floor(baseY + smoothedHeightMap[idx] * heightRange);
+            for (let dz = -1; dz <= 1; dz++) {
+                for (let dx = -1; dx <= 1; dx++) {
+                    const nx = x + dx, nz = z + dz;
+                    if (nx >= 0 && nx < width && nz >= 0 && nz < length) {
+                        const nh = Math.floor(baseY + smoothedHeightMap[nz * width + nx] * heightRange);
+                        if (nh < h - 1) h = Math.max(h - 1, nh + 1);
+                    }
+                }
+            }
+            erodedHeightMap[idx] = (h - baseY) / heightRange;
+        }
+    }
+    const finalHeightMap = settings.isCompletelyFlat ? heightMap : erodedHeightMap;
+
+    const blockY = new Int32Array(width * length);
+    for (let i = 0; i < blockY.length; i++) {
+        blockY[i] = Math.floor(baseY + finalHeightMap[i] * heightRange);
+    }
+
+    const BIOME_SCALE = 0.028;
+    const tempMap = generatePerlinNoise(width, length, {
+        octaveCount: 1, scale: BIOME_SCALE, persistence: 0.5, amplitude: 1.0, seed: seedNum + 7,
+    });
+    const temperatureOffset = (settings.temperature || 0.5) - 0.5;
+    const humidityMap = generatePerlinNoise(width, length, {
+        octaveCount: 1, scale: BIOME_SCALE * 0.8, persistence: 0.5, amplitude: 1.0, seed: seedNum + 8,
+    });
+    const biomeToggles = settings.biomeToggles || {};
+    const isBiomeEnabled = (b) => biomeToggles[b] !== false;
+    const fallbacks = {
+        snowy_plains: ["snowy_forest", "snowy_taiga", "plains"],
+        snowy_forest: ["snowy_taiga", "snowy_plains", "forest"],
+        snowy_taiga: ["snowy_forest", "snowy_plains", "taiga"],
+        plains: ["forest", "savanna"],
+        forest: ["taiga", "plains", "jungle"],
+        taiga: ["forest", "snowy_taiga", "plains"],
+        swamp: ["forest", "jungle", "plains"],
+        savanna: ["plains", "desert", "jungle"],
+        jungle: ["forest", "swamp", "savanna"],
+        desert: ["savanna", "plains"],
+        poplar_forest: ["forest", "taiga"],
+        cherry_grove: ["forest", "plains"],
+    };
+    const getFallback = (b) => {
+        for (const fb of (fallbacks[b] || ["plains"])) {
+            if (isBiomeEnabled(fb)) return fb;
+        }
+        return "plains";
+    };
+    const biomeEmphasis = settings.biomeEmphasis || {};
+    const humidityOffset = settings.humidityOffset ?? 0;
+
+    const biomeMap = new Array(width * length);
+    let rngState = (seedNum >>> 0) || 1;
+    const rng = () => {
+        rngState = (rngState + 0x6d2b79f5) | 0;
+        let t = Math.imul(rngState ^ (rngState >>> 15), 1 | rngState);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+
+    for (let z = 0; z < length; z++) {
+        for (let x = 0; x < width; x++) {
+            const idx = z * width + x;
+            const temp = tempMap[idx] + temperatureOffset;
+            const hum = humidityMap[idx] + humidityOffset;
+            let biome;
+            if (temp < 0.2) biome = hum < 0.3 ? "snowy_plains" : hum < 0.6 ? "snowy_forest" : "snowy_taiga";
+            else if (temp < 0.4) biome = hum < 0.3 ? "plains" : hum < 0.6 ? "forest" : "taiga";
+            else if (temp < 0.6) biome = hum < 0.3 ? "plains" : hum < 0.6 ? "forest" : "swamp";
+            else if (temp < 0.8) biome = hum < 0.3 ? "savanna" : hum < 0.6 ? "jungle" : "swamp";
+            else biome = hum < 0.3 ? "desert" : hum < 0.6 ? "savanna" : "jungle";
+            if (!isBiomeEnabled(biome)) biome = getFallback(biome);
+            const isForesty = ["forest", "taiga", "snowy_forest", "snowy_taiga"].includes(biome);
+            const poplarBoost = (biomeEmphasis["poplar_forest"] || 1) - 1;
+            const cherryBoost = (biomeEmphasis["cherry_grove"] || 1) - 1;
+            if (isForesty) {
+                if (temp < 0.5 && rng() < 0.3 + poplarBoost * 0.3 && isBiomeEnabled("poplar_forest")) biome = "poplar_forest";
+                else if (temp >= 0.5 && rng() < 0.25 + cherryBoost * 0.3 && isBiomeEnabled("cherry_grove")) biome = "cherry_grove";
+            }
+            for (const [eb, weight] of Object.entries(biomeEmphasis).filter(([, w]) => w > 1.1)) {
+                if (eb === biome || !isBiomeEnabled(eb)) continue;
+                if (rng() < ((weight - 1) * 0.22)) { biome = eb; break; }
+            }
+            biomeMap[idx] = biome;
+        }
+    }
+
+    return { blockY, biomeMap, seaLevel, width, length };
+}
+
+export default { generateHytopiaWorld };

@@ -24,12 +24,15 @@ import {
     rebuildTextureAtlas,
     updateChunkSystemCamera,
     updateTerrainChunks,
+    updateTerrainChunksFromStore,
 } from "./chunks/TerrainBuilderIntegration";
 import { meshesNeedsRefresh } from "./constants/performance";
 import {
     CHUNK_SIZE,
+    computeViewDistanceForWorld,
     getViewDistance,
     THRESHOLD_FOR_PLACING,
+    USE_VIRTUAL_TERRAIN,
 } from "./constants/terrain";
 import {
     processCustomBlock,
@@ -60,6 +63,7 @@ import {
     FindReplaceTool,
     ToolManager,
     WallTool,
+    SeedGeneratorTool,
 } from "./tools";
 import ZoneTool from "./tools/ZoneTool";
 import { zoneManager } from "./managers/ZoneManager";
@@ -80,6 +84,8 @@ import {
     handleTerrainMouseUp,
 } from "./utils/TerrainMouseUtils";
 import { getTerrainRaycastIntersection } from "./utils/TerrainRaycastUtils";
+import { VirtualTerrainStore } from "./managers/VirtualTerrainStore";
+import { createProgressiveLoader } from "./managers/ProgressiveRegionLoader";
 
 // Extend Window interface for custom properties
 declare global {
@@ -214,6 +220,7 @@ interface TerrainBuilderRef {
     setGridVisible: (visible: boolean) => void;
     setGridY: (baseY: number) => void;
     getGridY: () => number;
+    getTerrainHeightAt: (x: number, z: number) => number;
 }
 
 function optimizeRenderer(gl: THREE.WebGLRenderer | null) {
@@ -498,6 +505,20 @@ const TerrainBuilder = forwardRef<TerrainBuilderRef, TerrainBuilderProps>(
                 return false;
             }
 
+            if (useVirtualTerrainRef.current && virtualStoreRef.current) {
+                try {
+                    await virtualStoreRef.current.flushDirtyRegions();
+                    if (Object.keys(rotationsRef.current).length > 0) {
+                        await DatabaseManager.saveData(STORES.TERRAIN, "current-rotations", rotationsRef.current);
+                    }
+                    if (Object.keys(shapesRef.current).length > 0) {
+                        await DatabaseManager.saveData(STORES.TERRAIN, "current-shapes", shapesRef.current);
+                    }
+                    resetPendingChanges();
+                } catch (_) {}
+                return true;
+            }
+
             if (
                 !pendingChangesRef.current ||
                 !pendingChangesRef.current.terrain ||
@@ -740,6 +761,9 @@ const TerrainBuilder = forwardRef<TerrainBuilderRef, TerrainBuilderProps>(
         const shadowPlaneRef = useRef<THREE.Mesh>(null);
         // SDK-compatible: directional lights removed, face-based shading baked into vertex colors
         const terrainRef = useRef<Record<string, number>>({});
+        const virtualStoreRef = useRef<InstanceType<typeof VirtualTerrainStore> | null>(null);
+        const useVirtualTerrainRef = useRef(false);
+        const progressiveLoaderRef = useRef<ReturnType<typeof createProgressiveLoader> | null>(null);
         const rotationsRef = useRef<Record<string, number>>({}); // sparse: "x,y,z" → rotationIndex (only non-zero)
         const shapesRef = useRef<Record<string, string>>({}); // sparse: "x,y,z" → shapeType (only non-cube)
         const gridRef = useRef<THREE.GridHelper>(null);
@@ -1821,8 +1845,11 @@ const TerrainBuilder = forwardRef<TerrainBuilderRef, TerrainBuilderProps>(
 
             return positions;
         };
-        const getCurrentTerrainData = () => {
-            return terrainRef.current;
+        const getCurrentTerrainData = (): Record<string, number> => {
+            if (useVirtualTerrainRef.current && virtualStoreRef.current) {
+                return virtualStoreRef.current.getLoadedBlocksSnapshot() as Record<string, number>;
+            }
+            return (terrainRef.current || {}) as Record<string, number>;
         };
         const getCurrentRotationData = () => {
             return rotationsRef.current;
@@ -1832,6 +1859,55 @@ const TerrainBuilder = forwardRef<TerrainBuilderRef, TerrainBuilderProps>(
         };
         const updateTerrainFromToolBar = (terrainData) => {
             loadingManager.showLoading("Updating terrain...", 0);
+            const fromRegionStore = terrainData && (terrainData as any)._regions;
+            const useVirtualForBulk = fromRegionStore || (USE_VIRTUAL_TERRAIN && terrainData && !fromRegionStore && Object.keys(terrainData).length > 50000);
+            if (useVirtualForBulk) {
+                if (!virtualStoreRef.current) {
+                    const store = new VirtualTerrainStore({
+                        loadRegion: async (rk) => { const d = await DatabaseManager.getTerrainRegion(rk); return d || {}; },
+                        saveRegion: async (rk, data) => { await DatabaseManager.putTerrainRegion(rk, data); },
+                    });
+                    virtualStoreRef.current = store;
+                    terrainRef.current = store.asProxy();
+                    useVirtualTerrainRef.current = true;
+                    progressiveLoaderRef.current = createProgressiveLoader(store, () => {
+                        const cs = getChunkSystem();
+                        const cam = (cs as any)?._scene?.camera;
+                        return cam ? { x: cam.position.x, y: cam.position.y, z: cam.position.z } : null;
+                    }, async () => {
+                        if (store.getBlockCountApprox?.() > 0) {
+                            await updateTerrainChunksFromStore(store, false, null, rotationsRef.current, shapesRef.current);
+                            processChunkRenderQueue();
+                        }
+                    });
+                }
+                if (fromRegionStore) {
+                    virtualStoreRef.current!.bulkLoadFromRegions((terrainData as any)._regions);
+                } else {
+                    virtualStoreRef.current!.bulkLoad(terrainData);
+                }
+                loadingManager.updateLoading("Saving terrain regions...", 15);
+                virtualStoreRef.current!.flushDirtyRegions().then(() => {
+                    pendingChangesRef.current = { terrain: { added: {}, removed: {} }, environment: { added: [], removed: [] }, rotations: { added: {}, removed: {} }, shapes: { added: {}, removed: {} } };
+                    loadingManager.updateLoading("Building terrain...", 30);
+                    configureChunkLoading({ deferMeshBuilding: true, priorityDistance: 48, deferredBuildDelay: 5000 });
+                    if (getChunkSystem()) getChunkSystem().setBulkLoadingMode(true, 48);
+                    buildUpdateTerrain({ blocks: terrainRef.current, deferMeshBuilding: true });
+                    loadingManager.updateLoading("Initializing spatial hash...", 60);
+                    setTimeout(async () => {
+                        try {
+                            await initializeSpatialHash(true, false);
+                            totalBlocksRef.current = (terrainData as any)._blockCount ?? 0;
+                            loadingManager.updateLoading("Building meshes...", 85);
+                            processChunkRenderQueue();
+                            loadingManager.hideLoading();
+                        } catch (_) {
+                            loadingManager.hideLoading();
+                        }
+                    }, 100);
+                });
+                return;
+            }
             terrainRef.current = terrainData;
             loadingManager.updateLoading(
                 "Saving imported terrain to database...",
@@ -1938,7 +2014,15 @@ const TerrainBuilder = forwardRef<TerrainBuilderRef, TerrainBuilderProps>(
                 await terrainUndoRedoManager.clearUndoRedoHistory();
                 localStorage.setItem("IS_DATABASE_CLEARING", "true");
                 try {
-                    terrainRef.current = {};
+                    virtualStoreRef.current?.clear();
+                    if (!useVirtualTerrainRef.current) {
+                        terrainRef.current = {};
+                    }
+                    if (typeof window !== "undefined") {
+                        window.fullTerrainDataRef = terrainRef.current;
+                    }
+                    rotationsRef.current = {};
+                    shapesRef.current = {};
                     totalBlocksRef.current = 0;
                     clearChunks();
                     if (spatialGridManagerRef.current) {
@@ -1951,45 +2035,20 @@ const TerrainBuilder = forwardRef<TerrainBuilderRef, TerrainBuilderProps>(
                     isPlacingRef.current = false;
                     recentlyPlacedBlocksRef.current = new Set();
                     resetPendingChanges(); // Reset all pending changes first
-                    const clearUndoRedo = async () => {
-                        try {
-                            await DatabaseManager.saveData(
-                                STORES.UNDO,
-                                "states",
-                                []
-                            );
-                            await DatabaseManager.saveData(
-                                STORES.REDO,
-                                "states",
-                                []
-                            );
-                            if (undoRedoManager?.current?.clearHistory) {
-                                undoRedoManager.current.clearHistory();
-                            }
-                        } catch (error) {
-                            // Failed to clear undo/redo history
+                    try {
+                        await DatabaseManager.saveData(STORES.UNDO, "states", []);
+                        await DatabaseManager.saveData(STORES.REDO, "states", []);
+                        if (undoRedoManager?.current?.clearHistory) {
+                            undoRedoManager.current.clearHistory();
                         }
-                    };
-                    clearUndoRedo(); // Call async clear
+                    } catch (_) {}
                     if (DatabaseManager.deleteAllByPrefix) {
-                        DatabaseManager.deleteAllByPrefix(STORES.TERRAIN)
-                            .then(() => {
-                                resetPendingChanges();
-                                lastSaveTimeRef.current = Date.now();
-                            })
-                            .catch((error) => {
-                                // Error clearing terrain keys for project
-                            });
+                        await DatabaseManager.deleteAllByPrefix(STORES.TERRAIN);
                     } else {
-                        DatabaseManager.clearStore(STORES.TERRAIN)
-                            .then(() => {
-                                resetPendingChanges();
-                                lastSaveTimeRef.current = Date.now();
-                            })
-                            .catch((error) => {
-                                // Error clearing terrain store
-                            });
+                        await DatabaseManager.clearStore(STORES.TERRAIN);
                     }
+                    resetPendingChanges();
+                    lastSaveTimeRef.current = Date.now();
                 } catch (error) {
                     // Error during clearMap operation
                 } finally {
@@ -2151,8 +2210,11 @@ const TerrainBuilder = forwardRef<TerrainBuilderRef, TerrainBuilderProps>(
                 }
                 if (scene) {
                     try {
+                        const w = gridSizeRef.current ?? 5000;
+                        const sensible = computeViewDistanceForWorld(w, w, 64);
+                        const viewDist = Math.min(getViewDistance(), sensible);
                         await initChunkSystem(scene, {
-                            viewDistance: getViewDistance(),
+                            viewDistance: viewDist,
                             viewDistanceEnabled: true,
                         });
                     } catch (error) {
@@ -2205,10 +2267,98 @@ const TerrainBuilder = forwardRef<TerrainBuilderRef, TerrainBuilderProps>(
                                 })
                             );
                         }
+                        if (USE_VIRTUAL_TERRAIN) {
+                            const regionKeys = await DatabaseManager.listTerrainRegionKeys();
+                            if (regionKeys.length > 0) {
+                                useVirtualTerrainRef.current = true;
+                                const store = new VirtualTerrainStore({
+                                    loadRegion: async (rk) => {
+                                        const d = await DatabaseManager.getTerrainRegion(rk);
+                                        return d || {};
+                                    },
+                                    saveRegion: async (rk, data) => {
+                                        await DatabaseManager.putTerrainRegion(rk, data);
+                                    },
+                                });
+                                virtualStoreRef.current = store;
+                                terrainRef.current = store.asProxy();
+                                progressiveLoaderRef.current = createProgressiveLoader(store, () => {
+                                    const cs = getChunkSystem();
+                                    const cam = (cs as any)?._scene?.camera;
+                                    return cam ? { x: cam.position.x, y: cam.position.y, z: cam.position.z } : null;
+                                }, async () => {
+                                    if (store.getBlockCountApprox?.() > 0) {
+                                        await updateTerrainChunksFromStore(store, false, null, rotationsRef.current, shapesRef.current);
+                                        processChunkRenderQueue();
+                                    }
+                                });
+                                const loadAroundOrigin = regionKeys
+                                    .map((rk) => {
+                                        const [rx, ry, rz] = rk.split(",").map(Number);
+                                        const d = rx * rx + ry * ry + rz * rz;
+                                        return { rk, rx, ry, rz, d };
+                                    })
+                                    .sort((a, b) => a.d - b.d)
+                                    .slice(0, 24);
+                                for (const { rx, ry, rz } of loadAroundOrigin) {
+                                    await store.ensureRegionLoaded(rx, ry, rz);
+                                }
+                                totalBlocksRef.current = store.getBlockCountApprox();
+                                pendingChangesRef.current = {
+                                    terrain: { added: {}, removed: {} },
+                                    environment: { added: [], removed: [] },
+                                    rotations: { added: {}, removed: {} },
+                                    shapes: { added: {}, removed: {} },
+                                };
+                                try {
+                                    const rotations = await DatabaseManager.getData(STORES.TERRAIN, "current-rotations");
+                                    if (rotations && typeof rotations === "object") {
+                                        Object.entries(rotations).forEach(([k, v]) => {
+                                            if (typeof v === "number" && v > 0) rotationsRef.current[k] = v;
+                                        });
+                                    }
+                                    const shapes = await DatabaseManager.getData(STORES.TERRAIN, "current-shapes");
+                                    if (shapes && typeof shapes === "object") {
+                                        Object.entries(shapes).forEach(([k, v]) => {
+                                            if (typeof v === "string" && v !== "cube") shapesRef.current[k] = v;
+                                        });
+                                    }
+                                } catch (_) {}
+                                if (store.getBlockCountApprox() > 0) {
+                                    loadingManager.showLoading("Preloading textures...", 10);
+                                    setTimeout(async () => {
+                                        try {
+                                            const usedBlockIds = await store.getUsedBlockIds();
+                                            usedBlockIds.forEach((bid) => BlockTypeRegistry?.instance?.markBlockTypeAsEssential?.(bid));
+                                            if (BlockTypeRegistry?.instance && usedBlockIds.size > 0) {
+                                                await BlockTypeRegistry.instance.preload({ onlyEssential: true });
+                                            }
+                                            await rebuildTextureAtlas();
+                                            await updateTerrainChunksFromStore(store, true, environmentBuilderRef, rotationsRef.current, shapesRef.current);
+                                            updateChunkSystemCamera(threeCamera);
+                                            processChunkRenderQueue();
+                                            window.fullTerrainDataRef = terrainRef.current;
+                                            loadingManager.hideLoading();
+                                            setPageIsLoaded(true);
+                                            window.dispatchEvent(new CustomEvent("terrainLoaded"));
+                                        } catch (e) {
+                                            loadingManager.hideLoading();
+                                            setPageIsLoaded(true);
+                                        }
+                                    }, 100);
+                                } else {
+                                    loadingManager.hideLoading();
+                                    setPageIsLoaded(true);
+                                    window.dispatchEvent(new CustomEvent("terrainLoaded"));
+                                }
+                                return;
+                            }
+                        }
                         return DatabaseManager.getData(STORES.TERRAIN, "current");
                     })
                     .then(async (savedTerrain: any) => {
                         if (!mounted) return;
+                        if (useVirtualTerrainRef.current) return;
                         const terrainBlockCount = savedTerrain
                             ? Object.keys(savedTerrain).length
                             : 0;
@@ -2433,6 +2583,10 @@ const TerrainBuilder = forwardRef<TerrainBuilderRef, TerrainBuilderProps>(
             // Register zone tool
             const zoneTool = new ZoneTool(terrainBuilderProps);
             toolManagerRef.current.registerTool("zone", zoneTool);
+
+            // Register seed generator tool
+            const seedGeneratorTool = new SeedGeneratorTool(terrainBuilderProps);
+            toolManagerRef.current.registerTool("seed", seedGeneratorTool);
 
             // Initialize zone manager with scene
             zoneManager.initialize(scene);
@@ -3121,6 +3275,7 @@ const TerrainBuilder = forwardRef<TerrainBuilderRef, TerrainBuilderProps>(
             setGridVisible,
             setGridY,
             getGridY,
+            getTerrainHeightAt,
         })); // This is the correct syntax with just one closing parenthesis
 
         useEffect(() => {
@@ -3499,9 +3654,16 @@ const TerrainBuilder = forwardRef<TerrainBuilderRef, TerrainBuilderProps>(
         useEffect(() => {
             cameraManager.setInputDisabled(isInputDisabled);
         }, [isInputDisabled]);
+        const visibilityUpdateLastRef = useRef(0);
         const handleCameraMove = () => {
             if (!threeCamera) return;
+            progressiveLoaderRef.current?.update();
             updateChunkSystemCamera(threeCamera);
+            const now = performance.now();
+            if (now - visibilityUpdateLastRef.current >= 100) {
+                visibilityUpdateLastRef.current = now;
+                if (getChunkSystem()) getChunkSystem().forceUpdateChunkVisibility();
+            }
             loadNewChunksInViewDistance();
             processChunkRenderQueue();
         };
@@ -4064,6 +4226,7 @@ const TerrainBuilder = forwardRef<TerrainBuilderRef, TerrainBuilderProps>(
                             // Update player mesh transform and facing
                             if (window.__WE_PLAYER_MESH__) {
                                 const m = window.__WE_PLAYER_MESH__;
+                                m.visible = !(window as any).__WE_FPV__; // Hide body in first-person
                                 const last = window.__WE_LAST_POS__ || {
                                     x: p.x,
                                     y: p.y,
@@ -4229,14 +4392,27 @@ const TerrainBuilder = forwardRef<TerrainBuilderRef, TerrainBuilderProps>(
                                     radius * Math.cos(baseYaw)
                                 );
                             }
-                            const desired = target
-                                .clone()
-                                .add(window.__WE_CAM_OFFSET__);
+                            const fpv = !!(window as any).__WE_FPV__;
+                            const desired = fpv
+                                ? target.clone()
+                                : target.clone().add(window.__WE_CAM_OFFSET__);
                             // Frame-rate independent smoothing for camera follow
                             const camAlpha = 1 - Math.exp(-25 * dtClamped);
                             threeCamera.position.lerp(desired, camAlpha);
-                            // Smooth orientation as well to reduce visible shaking from discrete target updates
-                            {
+                            // FPV: camera at head, look in facing direction. TPV: look at player.
+                            const baseYaw = window.__WE_FACE_YAW__ !== undefined
+                                ? window.__WE_FACE_YAW__
+                                : window.__WE_CAM_OFFSET_YAW__ ?? window.__WE_TP_YAW__ ?? threeCamera.rotation.y;
+                            if (fpv) {
+                                const lookAhead = target.clone().add(
+                                    new THREE.Vector3(Math.sin(baseYaw), 0, Math.cos(baseYaw))
+                                );
+                                const currentQuat = threeCamera.quaternion.clone();
+                                threeCamera.lookAt(lookAhead);
+                                const desiredQuat = threeCamera.quaternion.clone();
+                                threeCamera.quaternion.copy(currentQuat);
+                                threeCamera.quaternion.slerp(desiredQuat, camAlpha);
+                            } else {
                                 const currentQuat = threeCamera.quaternion.clone();
                                 threeCamera.lookAt(target);
                                 const desiredQuat = threeCamera.quaternion.clone();
@@ -4560,6 +4736,22 @@ const TerrainBuilder = forwardRef<TerrainBuilderRef, TerrainBuilderProps>(
 
         function getGridY(): number {
             return baseGridYRef.current;
+        }
+
+        function getTerrainHeightAt(x: number, z: number): number {
+            const px = Math.floor(x);
+            const pz = Math.floor(z);
+            const data = terrainRef.current;
+            if (!data) return 1;
+            const maxY = 256;
+            for (let y = maxY; y >= 0; y--) {
+                const key = `${px},${y},${pz}`;
+                const blockId = data[key];
+                if (blockId != null && blockId !== 0) {
+                    return y + 1; // Top of block
+                }
+            }
+            return 1;
         }
 
         // Initialize GPU-optimized settings on mount

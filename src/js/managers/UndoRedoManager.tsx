@@ -711,7 +711,8 @@ function UndoRedoManager(
             const undoStates =
                 (await DatabaseManager.getData(STORES.UNDO, "states")) as UndoRedoState[] || [];
 
-            const newUndoStates = [changes, ...undoStates];
+            const MAX_UNDO_STATES = 20;
+            const newUndoStates = [changes, ...undoStates].slice(0, MAX_UNDO_STATES);
 
 
             try {

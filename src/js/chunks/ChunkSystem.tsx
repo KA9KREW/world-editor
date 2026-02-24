@@ -26,7 +26,7 @@ class ChunkSystem {
         this._chunkManager = new ChunkManager(scene);
         this._initialized = false;
         this._options = {
-            viewDistance: options.viewDistance || 256,
+            viewDistance: options.viewDistance || 50,
             viewDistanceEnabled:
                 options.viewDistanceEnabled !== undefined
                     ? options.viewDistanceEnabled
@@ -132,6 +132,64 @@ class ChunkSystem {
 
         this._chunkManager.updateChunks(chunks);
     }
+
+    /**
+     * Update chunks from VirtualTerrainStore in batches - avoids building full snapshot.
+     * Use this instead of updateFromTerrainData(store.getLoadedBlocksSnapshot()) for large worlds.
+     */
+    async updateFromTerrainDataFromStore(
+        store: { getBlocksInBatches: (batchSize: number, fn: (batch: [string, number][]) => void | Promise<void>) => Promise<void> },
+        rotationData?: Record<string, number>,
+        shapeData?: Record<string, string>
+    ) {
+        if (!this._initialized) return;
+        const chunkBlocks = new Map<string, Uint16Array>();
+        const chunkRotations = new Map<string, Map<number, number>>();
+        const chunkShapes = new Map<string, Map<number, string>>();
+        const BATCH_SIZE = 5000;
+
+        await store.getBlocksInBatches(BATCH_SIZE, (batch) => {
+            for (const [posKey, blockId] of batch) {
+                const [x, y, z] = posKey.split(",").map(Number);
+                const originCoordinate = {
+                    x: Math.floor(x / CHUNK_SIZE) * CHUNK_SIZE,
+                    y: Math.floor(y / CHUNK_SIZE) * CHUNK_SIZE,
+                    z: Math.floor(z / CHUNK_SIZE) * CHUNK_SIZE,
+                };
+                const chunkId = `${originCoordinate.x},${originCoordinate.y},${originCoordinate.z}`;
+                if (!chunkBlocks.has(chunkId)) {
+                    chunkBlocks.set(chunkId, new Uint16Array(CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE));
+                }
+                const localX = x - originCoordinate.x;
+                const localY = y - originCoordinate.y;
+                const localZ = z - originCoordinate.z;
+                const index = localX + CHUNK_SIZE * (localY + CHUNK_SIZE * localZ);
+                chunkBlocks.get(chunkId)![index] = blockId;
+                if (rotationData?.[posKey] && rotationData[posKey] > 0) {
+                    if (!chunkRotations.has(chunkId)) chunkRotations.set(chunkId, new Map());
+                    chunkRotations.get(chunkId)!.set(index, rotationData[posKey]);
+                }
+                if (shapeData?.[posKey] && shapeData[posKey] !== "cube") {
+                    if (!chunkShapes.has(chunkId)) chunkShapes.set(chunkId, new Map());
+                    chunkShapes.get(chunkId)!.set(index, shapeData[posKey]);
+                }
+            }
+        });
+
+        const chunks = [];
+        for (const [chunkId, blocks] of chunkBlocks.entries()) {
+            const [x, y, z] = chunkId.split(",").map(Number);
+            if (isNaN(x) || isNaN(y) || isNaN(z)) continue;
+            chunks.push({
+                originCoordinate: { x, y, z },
+                blocks,
+                rotations: chunkRotations.get(chunkId),
+                shapes: chunkShapes.get(chunkId),
+            });
+        }
+        this._chunkManager.updateChunks(chunks);
+    }
+
     /**
      * Update blocks in the chunk system
      * @param {Array} addedBlocks - The blocks to add
@@ -540,6 +598,8 @@ class ChunkSystem {
         this._chunkManager._chunkRemeshOptions.clear();
         this._chunkManager._blockTypeCache.clear();
         this._chunkManager._deferredMeshChunks.clear();
+        if (this._chunkManager._chunkLastMeshedTime) this._chunkManager._chunkLastMeshedTime.clear();
+        if (this._chunkManager._chunkLastQueuedTime) this._chunkManager._chunkLastQueuedTime.clear();
 
         if (this._scene) {
             this._scene.updateMatrixWorld(true);
@@ -565,9 +625,7 @@ class ChunkSystem {
             return null;
         }
 
-        (this._scene as any).camera.updateMatrixWorld(true);
-        (this._scene as any).camera.updateProjectionMatrix();
-
+        this.updateCamera();
         return this._chunkManager.forceUpdateAllChunkVisibility(isBulkLoading);
     }
     /**
@@ -625,6 +683,7 @@ class ChunkSystem {
 
             this._cameraPosition = camera.position.clone();
             this._frustum = frustum;
+            this._chunkManager.setFrustum(frustum);
         }
     }
 

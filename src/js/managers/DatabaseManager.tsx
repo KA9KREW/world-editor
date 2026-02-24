@@ -1,5 +1,6 @@
 import { DB_VERSION } from "../Constants";
 import { loadingManager } from "./LoadingManager";
+import { isPackedFormat, packRegion, toStoredFormat } from "../utils/BlockRegionPacker";
 export const STORES = {
     TERRAIN: "terrain",
     ENVIRONMENT: "environment",
@@ -529,11 +530,124 @@ export class DatabaseManager {
                 }
                 const request = store.put(data, targetKey);
 
-                request.onerror = () => reject(request.error);
+                request.onerror = () =>                 reject(request.error);
                 request.onsuccess = () => resolve();
             }
         });
     }
+
+    /** Region-based terrain storage for large worlds (10k+). Key format: "rx,ry,rz" */
+    static TERRAIN_REGION_PREFIX = "terrain_region_";
+
+    static async getTerrainRegion(regionKey: string): Promise<Record<string, number> | null> {
+        const db = await this.getDBConnection();
+        const projectId = this.getCurrentProjectId();
+        if (!projectId) return null;
+        const fullKey = this.composeKey(`${this.TERRAIN_REGION_PREFIX}${regionKey}`, projectId);
+        return new Promise((resolve, reject) => {
+            if (!db.objectStoreNames.contains(STORES.TERRAIN)) {
+                resolve(null);
+                return;
+            }
+            const tx = db.transaction(STORES.TERRAIN, "readonly");
+            const req = tx.objectStore(STORES.TERRAIN).get(fullKey);
+            req.onsuccess = () => resolve(req.result ?? null);
+            req.onerror = () => reject(req.error);
+        });
+    }
+
+    static async putTerrainRegion(regionKey: string, data: Record<string, number> | { _v: number; rx: number; ry: number; rz: number; d: Uint16Array }): Promise<void> {
+        const db = await this.getDBConnection();
+        const projectId = this.getCurrentProjectId();
+        if (!projectId) return;
+        const fullKey = this.composeKey(`${this.TERRAIN_REGION_PREFIX}${regionKey}`, projectId);
+        return new Promise((resolve, reject) => {
+            if (!db.objectStoreNames.contains(STORES.TERRAIN)) {
+                resolve();
+                return;
+            }
+            const tx = db.transaction(STORES.TERRAIN, "readwrite");
+            const store = tx.objectStore(STORES.TERRAIN);
+            let toStore: typeof data;
+            if (isPackedFormat(data)) {
+                toStore = data;
+            } else {
+                const parts = regionKey.split(",").map(Number);
+                if (parts.length >= 3 && typeof data === "object" && data !== null) {
+                    const legacy = data as Record<string, number>;
+                    let hasAny = false;
+                    for (const _ in legacy) { hasAny = true; break; }
+                    if (!hasAny) {
+                        store.delete(fullKey);
+                        tx.oncomplete = () => resolve();
+                        tx.onerror = () => reject((tx as any).error);
+                        return;
+                    }
+                    const packed = packRegion(legacy, parts[0], parts[1], parts[2]);
+                    toStore = toStoredFormat(parts[0], parts[1], parts[2], packed);
+                } else {
+                    toStore = data;
+                }
+            }
+            store.put(toStore, fullKey);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject((tx as any).error);
+        });
+    }
+
+    /** Save a full terrain object as regions (for seed generator / migration) */
+    static async saveTerrainAsRegions(terrainData: Record<string, number>): Promise<void> {
+        if (!terrainData || Object.keys(terrainData).length === 0) return;
+        const REGION_SIZE = 64;
+        const regions = new Map<string, Record<string, number>>();
+        for (const [posKey, blockId] of Object.entries(terrainData)) {
+            if (!blockId) continue;
+            const parts = posKey.split(",").map(Number);
+            if (parts.length < 3) continue;
+            const [x, y, z] = parts;
+            const rx = Math.floor(x / REGION_SIZE);
+            const ry = Math.floor(y / REGION_SIZE);
+            const rz = Math.floor(z / REGION_SIZE);
+            const rk = `${rx},${ry},${rz}`;
+            if (!regions.has(rk)) regions.set(rk, {});
+            regions.get(rk)![posKey] = blockId;
+        }
+        for (const [rk, data] of regions) {
+            await this.putTerrainRegion(rk, data);
+        }
+    }
+
+    static async listTerrainRegionKeys(): Promise<string[]> {
+        const db = await this.getDBConnection();
+        const projectId = this.getCurrentProjectId();
+        if (!projectId) return [];
+        const prefix = this.prefixForProject(projectId) + this.TERRAIN_REGION_PREFIX;
+        const upper = this.prefixForProject(projectId) + this.TERRAIN_REGION_PREFIX + "\uffff";
+        return new Promise((resolve, reject) => {
+            if (!db.objectStoreNames.contains(STORES.TERRAIN)) {
+                resolve([]);
+                return;
+            }
+            const tx = db.transaction(STORES.TERRAIN, "readonly");
+            const store = tx.objectStore(STORES.TERRAIN);
+            const range = IDBKeyRange.bound(prefix, upper);
+            const keys: string[] = [];
+            const req = store.openKeyCursor(range);
+            req.onsuccess = () => {
+                const cursor = (req as any).result;
+                if (cursor) {
+                    const fullKey = String(cursor.key);
+                    const regionKey = fullKey.substring(prefix.length);
+                    keys.push(regionKey);
+                    cursor.continue();
+                } else {
+                    resolve(keys);
+                }
+            };
+            req.onerror = () => reject(req.error);
+        });
+    }
+
     static async getData(storeName, key) {
         const db = await this.getDBConnection();
         return new Promise((resolve, reject) => {
@@ -922,6 +1036,28 @@ export class DatabaseManager {
             if (!meta) return;
             meta.updatedAt = Date.now();
             meta.lastOpenedAt = Date.now();
+            await new Promise<void>((resolve) => {
+                const tx = db.transaction(STORES.PROJECTS, "readwrite");
+                const store = tx.objectStore(STORES.PROJECTS);
+                const req = store.put(meta, projectId);
+                req.onsuccess = () => resolve();
+                req.onerror = () => resolve();
+            });
+        } catch (_) { }
+    }
+    static async saveProjectName(projectId: string, name: string): Promise<void> {
+        try {
+            const db = await this.getConnection();
+            const meta = await new Promise<any>((resolve) => {
+                const tx = db.transaction(STORES.PROJECTS, "readonly");
+                const store = tx.objectStore(STORES.PROJECTS);
+                const req = store.get(projectId);
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => resolve(null);
+            });
+            if (!meta) return;
+            meta.name = name || meta.name;
+            meta.updatedAt = Date.now();
             await new Promise<void>((resolve) => {
                 const tx = db.transaction(STORES.PROJECTS, "readwrite");
                 const store = tx.objectStore(STORES.PROJECTS);

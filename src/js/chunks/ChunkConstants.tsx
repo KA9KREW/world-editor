@@ -18,10 +18,14 @@ export const ChunkBufferGeometryData = {
     uvs: [],
 };
 
-export const MAX_LIQUID_MESH_POOL_SIZE = 50;
-export const MAX_SOLID_MESH_POOL_SIZE = 250;
+export const MAX_LIQUID_MESH_POOL_SIZE = 30;
+export const MAX_SOLID_MESH_POOL_SIZE = 80;
 
-export const CHUNKS_NUM_TO_BUILD_AT_ONCE = 32;
+/** Fewer chunks per frame = smoother UI during load; was 32 */
+export const CHUNKS_NUM_TO_BUILD_AT_ONCE = 8;
+
+/** Use Web Worker for chunk mesh generation (experimental, cube blocks only) */
+export const USE_CHUNK_MESH_WORKER = false;
 
 // ============================================================================
 // SDK-compatible lighting constants

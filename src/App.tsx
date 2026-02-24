@@ -136,7 +136,6 @@ function App() {
     const [isCompactMode, setIsCompactMode] = useState(true);
     const [cameraPosition, setCameraPosition] = useState(null);
     const [playerModeEnabled, setPlayerModeEnabled] = useState(false);
-    const lastBaseGridYRef = useRef<number | null>(null);
     const physicsRef = useRef<PhysicsManager | null>(null);
     const [bloomEnabled, setBloomEnabled] = useState(true); // Enabled by default for emissive glow
     const [ambientLightIntensity, setAmbientLightIntensity] = useState(1.0); // Track ambient light for bloom threshold
@@ -610,6 +609,8 @@ function App() {
         }
         const stateObj = (window as any).__WE_INPUT_STATE__ || { state: {} };
         (window as any).__WE_INPUT_STATE__ = stateObj;
+        (window as any).__WE_FLY_MODE__ = (window as any).__WE_FLY_MODE__ ?? false;
+        let lastSpaceDown = 0;
         const allowed: Record<string, boolean> = { w: true, a: true, s: true, d: true, sp: true, sh: true, c: true };
         const mapKey = (e: KeyboardEvent): string | null => {
             const k = e.key.toLowerCase();
@@ -621,6 +622,16 @@ function App() {
         const onKeyDown = (e: KeyboardEvent) => {
             const k = mapKey(e);
             if (!k || !allowed[k]) return;
+            if (k === 'sp') {
+                const now = performance.now();
+                if (now - lastSpaceDown < 350) {
+                    (window as any).__WE_FLY_MODE__ = !(window as any).__WE_FLY_MODE__;
+                    lastSpaceDown = 0;
+                    stateObj.state[k] = true; // start flying up immediately when toggling on
+                    return;
+                }
+                lastSpaceDown = now;
+            }
             stateObj.state[k] = true;
         };
         const onKeyUp = (e: KeyboardEvent) => {
@@ -636,43 +647,8 @@ function App() {
         };
     }, [playerModeEnabled]);
 
-    // Update physics ground plane when baseGridY changes while in player mode
-    useEffect(() => {
-        if (!playerModeEnabled || !physicsRef.current) {
-            lastBaseGridYRef.current = null; // Reset when player mode is disabled
-            return;
-        }
-
-        const updateGround = async () => {
-            const physics = physicsRef.current;
-            if (!physics) return;
-
-            const baseGridY = terrainBuilderRef.current?.getGridY?.() ?? 0;
-
-            // Only update if baseGridY actually changed
-            if (lastBaseGridYRef.current !== null && lastBaseGridYRef.current === baseGridY) {
-                return;
-            }
-
-            lastBaseGridYRef.current = baseGridY;
-            const groundY = baseGridY - 0.5; // Grid is at baseGridY - 0.5, matching raycast behavior
-
-            // Ensure physics is ready before updating ground
-            await physics.ready();
-            // Update ground position synchronously to avoid race conditions
-            physics.updateGroundY(groundY);
-        };
-
-        // Update immediately
-        updateGround();
-
-        // Also check periodically in case baseGridY changes externally (e.g., via SettingsMenu)
-        const interval = setInterval(updateGround, 500);
-
-        return () => {
-            clearInterval(interval);
-        };
-    }, [playerModeEnabled]);
+    // Physics ground plane is fixed at world floor (y=-10) - voxel collision handles terrain.
+    // No need to update when baseGridY changes.
 
     const togglePlayerMode = () => {
         const next = !playerModeEnabled;
@@ -684,6 +660,7 @@ function App() {
             const physics = ensurePhysics();
             (window as any).__WE_PHYSICS__ = physics;
             (window as any).__WE_INPUT_STATE__ = (window as any).__WE_INPUT_STATE__ || { state: {} };
+            (window as any).__WE_FPV__ = true; // First-person view: camera in player head
             // Initialize player-mode camera globals so first entry works without an arrow key press
             (window as any).__WE_CAM_KEYS__ = (window as any).__WE_CAM_KEYS__ || { left: false, right: false, up: false, down: false };
             (window as any).__WE_CAM_OFFSET_RADIUS__ = (window as any).__WE_CAM_OFFSET_RADIUS__ ?? 8.0;
@@ -692,12 +669,19 @@ function App() {
             (window as any).__WE_CAM_OFFSET_YAW__ = (window as any).__WE_CAM_OFFSET_YAW__ ?? (cameraManager.camera?.rotation?.y || 0);
             // No pointer lock
             physics.ready().then(() => {
-                // Get baseGridY from TerrainBuilder, default to 0 if not available
-                const baseGridY = terrainBuilderRef.current?.getGridY?.() ?? 0;
-                const groundY = baseGridY - 0.5; // Grid is at baseGridY - 0.5, matching raycast behavior
-                physics.addFlatGround(4000, groundY);
-                const pos = cameraPosition ?? { x: 0, y: 10, z: 0 } as any;
-                physics.createOrResetPlayer(new Vector3(pos.x ?? 0, pos.y ?? 10, pos.z ?? 0));
+                // Flat ground at world bottom (-10) - safety net only
+                const worldFloorY = -10;
+                physics.addFlatGround(4000, worldFloorY);
+                const pos = cameraPosition ?? { x: 0, y: 100, z: 0 } as any;
+                const sx = pos.x ?? 0;
+                const sz = pos.z ?? 0;
+                // Spawn on terrain surface if found; otherwise spawn high (100) and fall
+                const terrainSurfaceY = terrainBuilderRef.current?.getTerrainHeightAt?.(sx, sz) ?? 1;
+                const halfHeight = 0.75; // match physics capsule
+                const onTerrainY = terrainSurfaceY + halfHeight;
+                const minSpawnY = 100; // always spawn at least this high (avoids underground when terrain not loaded)
+                const spawnY = Math.max(onTerrainY, minSpawnY);
+                physics.createOrResetPlayer(new Vector3(sx, spawnY, sz));
                 // Register entity colliders for all entities with addCollider enabled
                 if (environmentBuilderRef.current?.registerAllEntityColliders) {
                     environmentBuilderRef.current.registerAllEntityColliders();
@@ -709,6 +693,8 @@ function App() {
                 environmentBuilderRef.current.clearAllEntityColliders();
             }
             try { delete (window as any).__WE_PHYSICS__; } catch (_) { }
+            try { (window as any).__WE_FLY_MODE__ = false; } catch (_) { }
+            try { (window as any).__WE_FPV__ = false; } catch (_) { }
             // Reset solid query flag so it can be set up again when player mode is re-enabled
             try { delete (window as any).__WE_SOLID_BOUND__; } catch (_) { }
             try { delete (window as any).__WE_IS_SOLID__; } catch (_) { }
@@ -1329,7 +1315,7 @@ function App() {
                                 top: "0",
                                 width: "2px",
                                 height: "100%",
-                                background: "#ffffff",
+                                background: "#ff0000",
                                 transform: "translateX(-50%)",
                             }}
                         />
@@ -1340,7 +1326,7 @@ function App() {
                                 left: "0",
                                 width: "100%",
                                 height: "2px",
-                                background: "#ffffff",
+                                background: "#ff0000",
                                 transform: "translateY(-50%)",
                             }}
                         />

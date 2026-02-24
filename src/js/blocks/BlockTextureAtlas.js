@@ -657,29 +657,41 @@ class BlockTextureAtlas {
                 ? this._calculateUVCoordinates(errorMetadata, uvOffset)
                 : [0, 0];
         }
+        const blockName = typeof blockType === "string" ? blockType : (blockType?.name || "");
+        const uvKey = uvOffset ? `${uvOffset[0]}-${uvOffset[1]}` : "0-0";
+        const cacheKey = `${blockName}|${blockFace}|${uvKey}`;
+        if (this._textureUVCache.has(cacheKey)) {
+            return this._textureUVCache.get(cacheKey);
+        }
 
         const faceCoord = FACE_NAME_TO_COORD_MAP[blockFace] || blockFace;
 
-        if (blockType.startsWith("data:image/")) {
-            const metadata = this._textureAtlasMetadata.get(blockType);
+        if (blockName.startsWith("data:image/")) {
+            const metadata = this._textureAtlasMetadata.get(blockName);
             if (metadata) {
-                return this._calculateUVCoordinates(metadata, uvOffset);
+                const result = this._calculateUVCoordinates(metadata, uvOffset);
+                this._textureUVCache.set(cacheKey, result);
+                return result;
             }
         }
 
-        const facePath = `blocks/${blockType}/${faceCoord}.png`;
+        const facePath = `blocks/${blockName}/${faceCoord}.png`;
         const faceMetadata = this._textureAtlasMetadata.get(facePath);
         if (faceMetadata) {
-            return this._calculateUVCoordinates(faceMetadata, uvOffset);
+            const result = this._calculateUVCoordinates(faceMetadata, uvOffset);
+            this._textureUVCache.set(cacheKey, result);
+            return result;
         }
 
-        const blockTypePath = `blocks/${blockType}`;
+        const blockTypePath = `blocks/${blockName}`;
         const blockTypeMetadata = this._textureAtlasMetadata.get(blockTypePath);
         if (blockTypeMetadata) {
-            return this._calculateUVCoordinates(blockTypeMetadata, uvOffset);
+            const result = this._calculateUVCoordinates(blockTypeMetadata, uvOffset);
+            this._textureUVCache.set(cacheKey, result);
+            return result;
         }
 
-        const warningKey = `${blockType}-${blockFace}`;
+        const warningKey = `${blockName}-${blockFace}`;
         if (!this._missingTextureWarnings.has(warningKey)) {
             console.warn(
                 `No texture found for ${blockType}, face ${blockFace}. Queuing for loading.`
@@ -687,17 +699,19 @@ class BlockTextureAtlas {
             this._missingTextureWarnings.add(warningKey);
 
             this.queueTextureForLoading(
-                `./assets/blocks/${blockType}/${faceCoord}.png`
+                `./assets/blocks/${blockName}/${faceCoord}.png`
             );
-            this.queueTextureForLoading(`./assets/blocks/${blockType}.png`);
+            this.queueTextureForLoading(`./assets/blocks/${blockName}.png`);
         }
 
         const errorMetadata = this._textureAtlasMetadata.get(
             "./assets/blocks/error.png"
         );
-        return errorMetadata
+        const result = errorMetadata
             ? this._calculateUVCoordinates(errorMetadata, uvOffset)
             : [0, 0];
+        this._textureUVCache.set(cacheKey, result);
+        return result;
     }
     /**
      * Load a texture from a data URI directly

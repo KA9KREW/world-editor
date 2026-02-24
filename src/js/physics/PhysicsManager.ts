@@ -368,6 +368,13 @@ export class PhysicsManager {
     ) {
         if (!this._world) return;
         if (this._playerBody) {
+            const flyMode = !!(typeof window !== "undefined" && (window as any).__WE_FLY_MODE__);
+            if (flyMode) {
+                this._playerBody.setGravityScale(0, true);
+            } else {
+                this._playerBody.setGravityScale(1, true);
+            }
+
             const lv = this._playerBody.linvel();
             let targetX = 0,
                 targetZ = 0;
@@ -467,6 +474,18 @@ export class PhysicsManager {
                 next.z = pos.z;
             }
 
+            if (flyMode) {
+                const flySpeed = 8;
+                const targetY = input.sp ? flySpeed : input.c ? -flySpeed : 0;
+                this._playerBody!.setLinvel(
+                    { x: targetX, y: targetY, z: targetZ },
+                    true
+                );
+                try {
+                    (window as any).__WE_PM_GROUNDED__ = false;
+                    (window as any).__WE_PM_VY__ = targetY;
+                } catch {}
+            } else {
             // Vertical collision: ground and ceiling
             let newVy = lv.y;
             const bottom = next.y - halfHeight;
@@ -627,6 +646,7 @@ export class PhysicsManager {
                 (window as any).__WE_PM_GROUNDED__ = grounded;
                 (window as any).__WE_PM_VY__ = newVy;
             } catch {}
+            }
         }
 
         this._world.step(this._eventQueue!);
