@@ -5,6 +5,8 @@ import { DatabaseManager, STORES } from "../managers/DatabaseManager";
 import { generateSeedPreviewDataUrl } from "../utils/thumbnailUtils";
 import { generateThumbnail } from "../utils/thumbnailUtils";
 import { deriveWorldFromSeed, seedStringToNumber } from "../utils/SeedDerivation";
+import { iteratePackedRegion } from "../utils/BlockRegionPacker";
+import { exportGeneratedMapToZip, type ExportOptions } from "../ImportExport";
 import {
     STONE_VARIANTS,
     DEEPSLATE_VARIANTS,
@@ -296,6 +298,133 @@ class SeedGeneratorTool extends BaseTool {
 
         this.isGenerating = false;
         return null;
+    }
+
+    /** Generate world and export directly to ZIP (no editor load). */
+    async generateWorldToZip(exportOptions: ExportOptions): Promise<void> {
+        if (this.isGenerating) return;
+        const opts = this.generationOptions;
+        if (!opts) return;
+
+        this.isGenerating = true;
+        this.notifyProgress("Generating world...", 0);
+        const seedNum = seedStringToNumber(opts.seed);
+        const settings: any = {
+            ...deriveWorldFromSeed(opts.seed, {
+                width: opts.width ?? 120,
+                length: opts.length ?? 120,
+                maxHeight: opts.maxHeight ?? 64,
+                clearMap: false,
+                hollowWorld: opts.hollowWorld,
+            }),
+        };
+
+        const blockTypesList = getBlockTypes();
+        const find = (name: string) => this.findBlockTypeId(blockTypesList, name);
+        const allNames = new Set<string>();
+        [STONE_VARIANTS, DEEPSLATE_VARIANTS, ROCKY_SURFACE, MOUNTAIN_STONE, MOSSY_VARIANTS, LAVA_NEARBY, SAND_VARIANTS, PLAINS_ACCENT]
+            .flat()
+            .forEach((v: any) => allNames.add(typeof v === "string" ? v : v.name));
+        Object.values(SURFACE_BY_BIOME).flat().forEach((n: string) => allNames.add(n));
+        Object.values(SUBSURFACE_BY_BIOME).flat().forEach((n: string) => allNames.add(n));
+        Object.values(TREE_BY_BIOME).forEach((t: any) => { allNames.add(t.log); allNames.add(t.leaf); });
+
+        const blockTypes: Record<string, number> = {
+            stone: find("stone"),
+            deepslate: find("deepslate"),
+            "cobbled-deepslate": find("cobbled-deepslate"),
+            andesite: find("andesite"),
+            granite: find("granite"),
+            diorite: find("diorite"),
+            "smooth-stone": find("smooth-stone"),
+            dirt: find("dirt"),
+            cobblestone: find("cobblestone"),
+            "mossy-cobblestone": find("mossy-cobblestone"),
+            "grass-block": find("grass-block"),
+            "grass-block-pine": find("grass-block-pine"),
+            "grass-flower-block": find("grass-flower-block"),
+            "grass-flower-block-pine": find("grass-flower-block-pine"),
+            "grass-snow-block": find("grass-snow-block"),
+            grass: find("grass"),
+            sand: find("sand"),
+            "sand-wet": find("sand-wet"),
+            sandstone: find("sandstone"),
+            snow: find("snow"),
+            "snow-rocky": find("snow-rocky"),
+            "cobblestone-snow": find("cobblestone-snow"),
+            ice: find("ice"),
+            "water-still": find("water"),
+            lava: find("lava"),
+            "lava-stone": find("lava-stone"),
+            "magma-block": find("magma-block"),
+            "hay-block": find("hay-block"),
+            "oak-log": find("oak-log"),
+            "birch-log": find("birch-log"),
+            "spruce-log": find("spruce-log"),
+            "oak-leaves": find("oak-leaves"),
+            "birch-leaves": find("birch-leaves"),
+            "spruce-leaves": find("spruce-leaves"),
+            "dark-oak-leaves": find("dark-oak-leaves"),
+            "jungle-leaves": find("jungle-leaves"),
+            "cherry-leaves": find("cherry-leaves"),
+            "azalea-flowering-leaves": find("azalea-flowering-leaves"),
+            "azalea-leaves": find("azalea-leaves"),
+            coal: find("coal-ore"),
+            iron: find("iron-ore"),
+            gold: find("gold-ore"),
+            diamond: find("diamond-ore"),
+            emerald: find("emerald-ore"),
+            ruby: find("ruby-ore"),
+            sapphire: find("sapphire-ore"),
+            "deepslate-coal": find("deepslate-coal-ore"),
+            "deepslate-iron": find("deepslate-iron-ore"),
+            "deepslate-gold": find("deepslate-gold-ore"),
+            "deepslate-diamond": find("deepslate-diamond-ore"),
+            "deepslate-emerald": find("deepslate-emerald-ore"),
+            "deepslate-ruby": find("deepslate-ruby-ore"),
+            "deepslate-sapphire": find("deepslate-sapphire-ore"),
+            "mushroom-stem": find("mushroom-stem"),
+            "brown-mushroom-block": find("brown-mushroom-block"),
+            "red-mushroom-block": find("red-mushroom-block"),
+            "stone-bricks": find("stone-bricks"),
+            "mossy-stone-bricks": find("mossy-stone-bricks"),
+        };
+
+        try {
+            const result: any = generateHytopiaWorld(
+                settings,
+                seedNum,
+                blockTypes,
+                (msg: string, pct: number) => this.notifyProgress(msg, pct)
+            );
+            if (!result) {
+                this.isGenerating = false;
+                return;
+            }
+
+            const { blockStore } = result;
+            let terrainData: Record<string, number> = {};
+            if (blockStore) {
+                for (const [, r] of blockStore.getRegionsForBulkLoad()) {
+                    if (!r?.packed) continue;
+                    const { rx, ry, rz } = r;
+                    for (const [posKey, blockId] of iteratePackedRegion(r.packed, rx, ry, rz)) {
+                        terrainData[posKey] = blockId;
+                    }
+                }
+            } else {
+                terrainData = result.terrainData || {};
+            }
+
+            this.notifyProgress("Writing map.json to ZIP...", 95);
+            await exportGeneratedMapToZip(terrainData, exportOptions);
+            this.notifyProgress("Done!", 100);
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.notifyProgress(`Error: ${msg}`, -1);
+            console.error("Generate to ZIP failed:", err);
+        }
+        this.isGenerating = false;
     }
 
     private async forceSaveTerrain(

@@ -181,6 +181,7 @@ interface TerrainBuilderRef {
     buildUpdateTerrain: (options?: any) => Promise<void>;
     updateTerrainFromToolBar: (terrainData: Record<string, number>) => void;
     getCurrentTerrainData: () => Record<string, number>;
+    getFullTerrainDataForExport?: () => Promise<Record<string, number>>;
     getCurrentRotationData: () => Record<string, number>;
     clearMap: () => Promise<void>;
     saveTerrainManually: () => void;
@@ -1851,6 +1852,12 @@ const TerrainBuilder = forwardRef<TerrainBuilderRef, TerrainBuilderProps>(
             }
             return (terrainRef.current || {}) as Record<string, number>;
         };
+        const getFullTerrainDataForExport = async (): Promise<Record<string, number>> => {
+            if (useVirtualTerrainRef.current) {
+                return DatabaseManager.getAllTerrainBlocksFromRegions();
+            }
+            return getCurrentTerrainData();
+        };
         const getCurrentRotationData = () => {
             return rotationsRef.current;
         };
@@ -2811,6 +2818,7 @@ const TerrainBuilder = forwardRef<TerrainBuilderRef, TerrainBuilderProps>(
             buildUpdateTerrain,
             updateTerrainFromToolBar,
             getCurrentTerrainData,
+            getFullTerrainDataForExport,
             getCurrentRotationData,
             getCurrentShapeData,
             clearMap,

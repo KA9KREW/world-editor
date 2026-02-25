@@ -1,6 +1,6 @@
 import { DB_VERSION } from "../Constants";
 import { loadingManager } from "./LoadingManager";
-import { isPackedFormat, packRegion, toStoredFormat } from "../utils/BlockRegionPacker";
+import { isPackedFormat, packRegion, toStoredFormat, fromStoredFormat, iteratePackedRegion } from "../utils/BlockRegionPacker";
 export const STORES = {
     TERRAIN: "terrain",
     ENVIRONMENT: "environment",
@@ -615,6 +615,22 @@ export class DatabaseManager {
         for (const [rk, data] of regions) {
             await this.putTerrainRegion(rk, data);
         }
+    }
+
+    /** Load all terrain blocks from region storage (for full export when using virtual terrain). */
+    static async getAllTerrainBlocksFromRegions(): Promise<Record<string, number>> {
+        const keys = await this.listTerrainRegionKeys();
+        const out: Record<string, number> = {};
+        for (const rk of keys) {
+            const raw = await this.getTerrainRegion(rk);
+            if (!raw) continue;
+            const parsed = fromStoredFormat(raw as any, rk);
+            if (!parsed) continue;
+            for (const [posKey, blockId] of iteratePackedRegion(parsed.packed, parsed.rx, parsed.ry, parsed.rz)) {
+                out[posKey] = blockId;
+            }
+        }
+        return out;
     }
 
     static async listTerrainRegionKeys(): Promise<string[]> {

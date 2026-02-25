@@ -6,6 +6,7 @@ import {
 } from "../tools/SeedGeneratorTool";
 import { seedStringToNumber, deriveWorldFromSeed } from "../utils/SeedDerivation";
 import { computePreviewData } from "../utils/TerrainGenerator";
+import { defaultExportOptions, type ExportOptions } from "../ImportExport";
 
 interface Props {
     seedGeneratorTool: SeedGeneratorTool | undefined;
@@ -124,6 +125,7 @@ export default function SeedGeneratorToolOptionsSection({
     const [etaSeconds, setEtaSeconds] = useState<number | null>(null);
     const startTimeRef = useRef<number | null>(null);
     const [favorites, setFavorites] = useState<string[]>(() => loadFavorites());
+    const [exportToZipOptions, setExportToZipOptions] = useState<ExportOptions>({ ...defaultExportOptions });
 
     const syncToTool = useCallback(() => {
         if (!seedGeneratorTool) return;
@@ -183,6 +185,17 @@ export default function SeedGeneratorToolOptionsSection({
         setEtaSeconds(null);
         startTimeRef.current = null;
         await seedGeneratorTool.generateWorldFromSeed();
+    };
+
+    const handleGenerateToZip = async () => {
+        if (!seedGeneratorTool || isGenerating) return;
+        syncToTool();
+        setIsGenerating(true);
+        setProgressPercent(0);
+        setProgressMessage("Generating to ZIP...");
+        setEtaSeconds(null);
+        startTimeRef.current = null;
+        await seedGeneratorTool.generateWorldToZip(exportToZipOptions);
     };
 
     const handleRandomSeed = () => {
@@ -259,9 +272,9 @@ export default function SeedGeneratorToolOptionsSection({
                 <div className="mt-2 flex items-center gap-2">
                     <HeightmapPreview
                         seed={seed}
-                        width={sizePreset === "custom" ? Math.max(10, Math.min(500, parseInt(customWidth, 10) || 120)) : (SIZE_PRESETS[sizePreset]?.width ?? 120)}
-                        length={sizePreset === "custom" ? Math.max(10, Math.min(500, parseInt(customLength, 10) || 120)) : (SIZE_PRESETS[sizePreset]?.length ?? 120)}
-                        maxHeight={sizePreset === "custom" ? Math.max(32, Math.min(256, parseInt(customMaxHeight, 10) || 64)) : (SIZE_PRESETS[sizePreset]?.maxHeight ?? 64)}
+                        width={sizePreset === "custom" ? Math.max(10, parseInt(customWidth, 10) || 120) : (SIZE_PRESETS[sizePreset]?.width ?? 120)}
+                        length={sizePreset === "custom" ? Math.max(10, parseInt(customLength, 10) || 120) : (SIZE_PRESETS[sizePreset]?.length ?? 120)}
+                        maxHeight={sizePreset === "custom" ? Math.max(32, parseInt(customMaxHeight, 10) || 64) : (SIZE_PRESETS[sizePreset]?.maxHeight ?? 64)}
                     />
                     <span className="text-[10px] text-[#F1F1F1]/50">Preview</span>
                 </div>
@@ -393,6 +406,51 @@ export default function SeedGeneratorToolOptionsSection({
                     }`}
                 >
                     {isGenerating ? "Generating..." : "Generate World"}
+                </button>
+
+                <span className={sectionTitleClass}>Generate to ZIP</span>
+                <p className="text-[10px] text-[#F1F1F1]/50 mb-1">
+                    Generate map straight to map.json in ZIP (no editor load). Full map saved.
+                </p>
+                <div className="flex flex-col gap-1 mb-1">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                        <input
+                            type="checkbox"
+                            checked={exportToZipOptions.includeBlockTextures}
+                            onChange={(e) => setExportToZipOptions((o) => ({ ...o, includeBlockTextures: e.target.checked }))}
+                            className="w-3.5 h-3.5 rounded"
+                        />
+                        <span className={labelClass}>Include Default Block Textures</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                        <input
+                            type="checkbox"
+                            checked={exportToZipOptions.includeModels}
+                            onChange={(e) => setExportToZipOptions((o) => ({ ...o, includeModels: e.target.checked }))}
+                            className="w-3.5 h-3.5 rounded"
+                        />
+                        <span className={labelClass}>Include Default Model Files</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                        <input
+                            type="checkbox"
+                            checked={exportToZipOptions.includeSkybox}
+                            onChange={(e) => setExportToZipOptions((o) => ({ ...o, includeSkybox: e.target.checked }))}
+                            className="w-3.5 h-3.5 rounded"
+                        />
+                        <span className={labelClass}>Include Skybox Images</span>
+                    </label>
+                </div>
+                <button
+                    onClick={handleGenerateToZip}
+                    disabled={isGenerating}
+                    className={`w-full py-2 text-sm font-semibold rounded transition-colors ${
+                        isGenerating
+                            ? "bg-gray-600 text-gray-400 cursor-not-allowed"
+                            : "bg-blue-600 hover:bg-blue-700 text-white cursor-pointer"
+                    }`}
+                >
+                    {isGenerating ? "..." : "Generate to ZIP"}
                 </button>
 
                 {/* Progress bar */}

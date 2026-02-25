@@ -381,14 +381,14 @@ export function generateHytopiaWorld(
                         terrainData[`${worldX},${y},${worldZ}`] = getSurfaceBlock(
                             biome, blockTypes, rv, settings.cobblestoneFeatures
                         );
-                    } else {
+                        } else {
                         terrainData[`${worldX},${y},${worldZ}`] = getSubSurfaceBlock(
                             biome, blockTypes, surfaceHeight - y
                         );
                     }
                     blocksCount++;
-                }
-            } else {
+                        }
+                    } else {
                 // Normal: bedrock at y=0,1 + full terrain
                 const bedrockId = blockTypes.deepslate || blockTypes["lava-stone"] || blockTypes.stone;
                 terrainData[`${worldX},0,${worldZ}`] = bedrockId;
@@ -411,7 +411,7 @@ export function generateHytopiaWorld(
                         terrainData[`${worldX},${y},${worldZ}`] = getSubSurfaceBlock(
                             biome, blockTypes, surfaceHeight - y
                         );
-                    } else {
+                            } else {
                         terrainData[`${worldX},${y},${worldZ}`] = getStoneBlock(blockTypes, y, rng);
                     }
                     blocksCount++;
@@ -753,11 +753,11 @@ export function generateHytopiaWorld(
 
                             placed.add(key);
                             terrainData[key] = oreId;
+                                    }
+                                }
+                            }
                         }
                     }
-                }
-            }
-        }
 
         updateProgress("Ore veins placed", 80);
     }
@@ -1256,7 +1256,7 @@ export function computePreviewData(settings, seedNum) {
             const idx = z * width + x;
             if (settings.isCompletelyFlat) { erodedHeightMap[idx] = heightMap[idx]; continue; }
             let h = Math.floor(baseY + smoothedHeightMap[idx] * heightRange);
-            for (let dz = -1; dz <= 1; dz++) {
+                        for (let dz = -1; dz <= 1; dz++) {
                 for (let dx = -1; dx <= 1; dx++) {
                     const nx = x + dx, nz = z + dz;
                     if (nx >= 0 && nx < width && nz >= 0 && nz < length) {

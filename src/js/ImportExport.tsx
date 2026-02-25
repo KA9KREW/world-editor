@@ -957,7 +957,11 @@ export const exportMapFile = async (
     options: ExportOptions = defaultExportOptions
 ) => {
     try {
-        const currentTerrainData = terrainBuilderRef.current.getCurrentTerrainData() || {};
+        loadingManager.showLoading("Preparing to export map...", 0);
+        const getFullTerrain = terrainBuilderRef.current.getFullTerrainDataForExport;
+        const currentTerrainData = getFullTerrain
+            ? (await getFullTerrain()) || {}
+            : (terrainBuilderRef.current.getCurrentTerrainData() || {});
         const hasBlocks = Object.keys(currentTerrainData).length > 0;
 
         const environmentObjects = environmentBuilderRef.current.getAllEnvironmentObjects();
@@ -966,8 +970,6 @@ export const exportMapFile = async (
             alert("Nothing to export! Add blocks or models first.");
             return;
         }
-
-        loadingManager.showLoading("Preparing to export map...", 0);
 
         loadingManager.updateLoading("Retrieving environment data...", 10);
 
@@ -1606,5 +1608,192 @@ export const exportMapFile = async (
         console.error("Error exporting map file:", error);
         alert("Error exporting map. Please try again.");
         throw error; // Re-throw error after handling
+    }
+};
+
+/**
+ * Export generated terrain directly to a ZIP file (map.json + optional assets).
+ * Used by Seed Generator "Generate to ZIP" - no editor load, writes straight to file.
+ */
+export const exportGeneratedMapToZip = async (
+    terrainData: Record<string, number>,
+    options: ExportOptions = defaultExportOptions
+) => {
+    const { getBlockTypes } = await import("./TerrainBuilder");
+    try {
+        loadingManager.showLoading("Building map.json...", 10);
+        const simplifiedTerrain = Object.entries(terrainData).reduce((acc, [key, value]) => {
+            if (key.split(",").length === 3 && typeof value === "number" && value > 0) {
+                acc[key] = value;
+            }
+            return acc;
+        }, {} as Record<string, number>);
+
+        const allBlockTypes = getBlockTypes();
+        const sanitizeName = (name: string) => name.replace(/\s+/g, "_").toLowerCase();
+        const FACE_KEYS = ["+x", "-x", "+y", "-y", "+z", "-z"] as const;
+        const getFileExtensionFromUri = (uri: string) => {
+            if (uri.startsWith("data:")) {
+                const m = uri.match(/^data:image\/([a-zA-Z0-9+]+);/);
+                return m?.[1] === "jpeg" ? "jpg" : (m?.[1] || "png");
+            }
+            return uri.split(".").pop()?.split("?")[0]?.toLowerCase() || "png";
+        };
+
+        const usedBlockIds = new Set<number>();
+        Object.values(simplifiedTerrain).forEach((id) => usedBlockIds.add(id));
+        const usedBlockTypes = allBlockTypes.filter((b) => usedBlockIds.has(b.id));
+        const shapesPerBlockId = new Map<number, Set<string>>();
+        usedBlockIds.forEach((id) => shapesPerBlockId.set(id, new Set(["cube"])));
+
+        const MAX_EXPORT_IDS = 254;
+        const exportBlockTypeEntries: { originalId: number; shape: string; exportId: number }[] = [];
+        let nextExportId = 1;
+        for (const originalId of Array.from(shapesPerBlockId.keys()).sort((a, b) => a - b)) {
+            const shapes = Array.from(shapesPerBlockId.get(originalId)!);
+            for (const shape of shapes.sort((a, b) => (a === "cube" ? -1 : b === "cube" ? 1 : a.localeCompare(b)))) {
+                exportBlockTypeEntries.push({ originalId, shape, exportId: nextExportId++ });
+            }
+        }
+        if (exportBlockTypeEntries.length > MAX_EXPORT_IDS) {
+            loadingManager.hideLoading();
+            alert(`Too many block types (${exportBlockTypeEntries.length}). Max ${MAX_EXPORT_IDS}.`);
+            return;
+        }
+
+        const blockShapeToExportId = new Map<string, number>();
+        exportBlockTypeEntries.forEach((e) => blockShapeToExportId.set(`${e.originalId}:${e.shape}`, e.exportId));
+
+        const remappedTerrain = Object.entries(simplifiedTerrain).reduce((acc, [key, value]) => {
+            const exportId = blockShapeToExportId.get(`${value}:cube`);
+            if (exportId) acc[key] = exportId;
+            return acc;
+        }, {} as Record<string, number>);
+
+        loadingManager.updateLoading("Building export data...", 40);
+        const exportData = {
+            blockTypes: exportBlockTypeEntries.map((entry) => {
+                const block = usedBlockTypes.find((b) => b.id === entry.originalId);
+                if (!block) return null;
+                const isMulti = block.isMultiTexture || false;
+                const sanitized = sanitizeName(block.name);
+                let textureUriForJson: string | undefined;
+                if (isMulti) textureUriForJson = `blocks/${block.name}`;
+                else if (block.textureUri) textureUriForJson = `blocks/${sanitized}.${getFileExtensionFromUri(block.textureUri)}`;
+                return {
+                    id: entry.exportId,
+                    name: block.name,
+                    textureUri: textureUriForJson,
+                    isCustom: block.isCustom || (block.id >= 1000 && block.id < 2000),
+                    isMultiTexture: isMulti,
+                    lightLevel: (block as any).lightLevel,
+                    isLiquid: (block as any).isLiquid === true,
+                };
+            }).filter(Boolean),
+            blocks: remappedTerrain,
+            entities: {},
+            zones: zoneManager.exportZones(),
+            version: version || "1.0.0",
+        };
+
+        loadingManager.updateLoading("Creating ZIP...", 60);
+        const zip = new JSZip();
+        const textureInfos = new Set<{ uri: string; blockName: string | null; isMulti: boolean; fileName: string; isCustom: boolean }>();
+        usedBlockTypes.forEach((block) => {
+            const isCustom = block.isCustom || (block.id >= 1000 && block.id < 2000);
+            const sanitized = sanitizeName(block.name);
+            const isMulti = block.isMultiTexture || false;
+            if (!isMulti && block.textureUri) {
+                textureInfos.add({ uri: block.textureUri, blockName: null, isMulti, fileName: `${sanitized}.${getFileExtensionFromUri(block.textureUri)}`, isCustom });
+            }
+            if (isMulti && block.sideTextures) {
+                FACE_KEYS.forEach((fk) => {
+                    const uri = block.sideTextures?.[fk] || block.textureUri;
+                    if (uri) textureInfos.add({ uri, blockName: block.name, isMulti, fileName: `${fk}.${getFileExtensionFromUri(uri)}`, isCustom });
+                });
+            }
+        });
+
+        const hasBlockTextures = Array.from(textureInfos).some((t) => t.isCustom || options.includeBlockTextures);
+        const blocksFolder = hasBlockTextures ? zip.folder("blocks") : null;
+        const blankPng = async () => {
+            const c = document.createElement("canvas");
+            c.width = 24;
+            c.height = 24;
+            return new Promise<Blob>((r) => c.toBlob((b) => r(b!), "image/png"));
+        };
+        const uriCache = new Map<string, Blob>();
+
+        if (blocksFolder) {
+            const addTex = async (tex: { uri: string; blockName: string | null; isMulti: boolean; fileName: string }) => {
+                if (!tex.uri) return blankPng().then((b) => blocksFolder.file(tex.fileName, b));
+                if (uriCache.has(tex.uri)) return blocksFolder.file(tex.fileName, uriCache.get(tex.uri)!);
+                let blob: Blob;
+                try {
+                    const res = await fetch(tex.uri);
+                    blob = await res.blob();
+                } catch {
+                    blob = await blankPng();
+                }
+                uriCache.set(tex.uri, blob);
+                const folder = tex.isMulti && tex.blockName ? blocksFolder.folder(tex.blockName) : blocksFolder;
+                folder?.file(tex.fileName, blob);
+            };
+            for (const tex of textureInfos) {
+                if (!tex.isCustom && !options.includeBlockTextures) continue;
+                await addTex(tex);
+            }
+        }
+
+        const selectedSkybox = await DatabaseManager.getData(STORES.SETTINGS, `project:${DatabaseManager.getCurrentProjectId()}:selectedSkybox`);
+        const isCustomSky = typeof selectedSkybox === "string" && selectedSkybox && !DEFAULT_SKYBOXES.includes(selectedSkybox);
+        const includeSky = isCustomSky || options.includeSkybox;
+        if (typeof selectedSkybox === "string" && selectedSkybox && includeSky) {
+            const skyboxesFolder = zip.folder("skyboxes");
+            const skyboxFolder = skyboxesFolder?.folder(selectedSkybox);
+            if (skyboxFolder) {
+                const faceKeys = ["+x", "-x", "+y", "-y", "+z", "-z"];
+                if (isCustomSky) {
+                    const customSkyboxes = (await DatabaseManager.getData(STORES.SETTINGS, "customSkyboxes") || []) as any[];
+                    const cs = customSkyboxes.find((s: any) => s.name === selectedSkybox);
+                    if (cs?.faceTextures) {
+                        for (const fk of faceKeys) {
+                            const dataUri = cs.faceTextures[fk];
+                            if (dataUri) {
+                                const blob = await (await fetch(dataUri)).blob();
+                                skyboxFolder.file(`${fk}.png`, blob);
+                            }
+                        }
+                    }
+                } else {
+                    for (const fk of faceKeys) {
+                        const uri = `assets/skyboxes/${selectedSkybox}/${fk}.png`;
+                        try {
+                            const r = await fetch(uri);
+                            if (r.ok) skyboxFolder.file(`${fk}.png`, await r.blob());
+                        } catch {}
+                    }
+                }
+            }
+        }
+
+        zip.file("map.json", new Blob([JSON.stringify(exportData, null, 2)], { type: "application/json" }));
+        const zonesTs = zoneManager.generateZonesTypeScript();
+        if (zonesTs) zip.file("zones.ts", new Blob([zonesTs], { type: "text/typescript" }));
+
+        loadingManager.updateLoading("Preparing download...", 90);
+        const zipBlob = await zip.generateAsync({ type: "blob" });
+        const url = URL.createObjectURL(zipBlob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "map_export.zip";
+        a.click();
+        URL.revokeObjectURL(url);
+        loadingManager.hideLoading();
+    } catch (error) {
+        loadingManager.hideLoading();
+        console.error("Error exporting generated map:", error);
+        alert("Error exporting map. Please try again.");
+        throw error;
     }
 };
